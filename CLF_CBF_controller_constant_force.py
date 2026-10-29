@@ -196,13 +196,21 @@ def get_eef_wrench_from_ft_sensor(env, robot,
         raw_ft_sensor_reading, tool_mass, tool_com_eef, R_eef_to_world
     )
     
+    # -----------------------------------------------------------
+    # External Wrench in Local Tool (EEF) Frame
+    # -----------------------------------------------------------
     force_eef = -wrench_compensated[:3]
     torque_eef = -wrench_compensated[3:]
+    ee_wrench_tool = np.concatenate([force_eef, torque_eef])
     
+    # -----------------------------------------------------------
+    # External Wrench in World Frame
+    # -----------------------------------------------------------
     force_world = R_eef_to_world @ force_eef
     torque_world = R_eef_to_world @ torque_eef
+    ee_wrench_world = np.concatenate([force_world, torque_world])
     
-    return np.concatenate([force_world, torque_world])
+    return ee_wrench_world, ee_wrench_tool
 
 def get_joint_dynamics(robot):
     """Returns joint-space inertia matrix M and bias forces h (Coriolis + Gravity)."""
@@ -525,7 +533,7 @@ eef_name = robot.sim.model.site_id2name(eef_id)
 step_idx = 0
 print("\nStarting Force-Controlled Impedance Tracking Replay...")
 print("="*110)
-print(f"{'Step':>5} | {'EE Position (X, Y, Z) [m]':>28} | {'World Forces (Fx, Fy, Fz) [N]':>30} | {'World Torques (Tx, Ty, Tz) [Nm]':>30}")
+print(f"{'Step':>5} | {'EE Position (X, Y, Z) [m]':>28} | {'World Forces (Fx, Fy, Fz) [N]':>30} | {'Tool Torques (Tx, Ty, Tz) [Nm]':>30}")
 print("="*110)
 
 try:
@@ -540,7 +548,10 @@ try:
         if np.dot(q_desired, quat_current) < 0:
             q_desired = -q_desired
 
-        ee_wrench_world = get_eef_wrench_from_ft_sensor(
+        # ----------------------------------------------------------
+        # Read External Wrench (World Frame & Tool Frame)
+        # ----------------------------------------------------------
+        ee_wrench_world, ee_wrench_tool = get_eef_wrench_from_ft_sensor(
             env, robot,
             tool_mass=TOOL_MASS,
             tool_com_eef=TOOL_COM_EEF,
@@ -549,6 +560,10 @@ try:
             torque_noise_std=0.005
         )
         wrench_list.append(ee_wrench_world.copy())
+
+        # Extract external force and torque directly in the Tool Frame
+        force_tool = ee_wrench_tool[:3]    # [Fx, Fy, Fz] in tool frame
+        torque_tool = ee_wrench_tool[3:]   # [Tx, Ty, Tz] in tool frame
 
         raw_sensor_wrench = get_contact_wrench_at_eef(env, robot)
         wrench_sensor_list.append(raw_sensor_wrench.copy())
@@ -559,8 +574,8 @@ try:
         if step_idx % 20 == 0:
             pos_str = f"[{x_current[0]:.3f}, {x_current[1]:.3f}, {x_current[2]:.3f}]"
             force_str = f"[{ee_wrench_world[0]:.2f}, {ee_wrench_world[1]:.2f}, {ee_wrench_world[2]:.2f}]"
-            torque_str = f"[{ee_wrench_world[3]:.3f}, {ee_wrench_world[4]:.3f}, {ee_wrench_world[5]:.3f}]"
-            print(f"{step_idx:5d} | {pos_str:>28} | {force_str:>30} | {torque_str:>30}")
+            torque_str = f"[{torque_tool[0]:.3f}, {torque_tool[1]:.3f}, {torque_tool[2]:.3f}]"
+            print(f"{step_idx:5d} | {pos_str:>28} | {force_str:>30} | Tool Torque (Tx, Ty, Tz): {torque_str:>25}")
 
         # ----------------------------------------------------------
         # 1. Contact State
