@@ -6,7 +6,8 @@ import robosuite as suite
 import robosuite.utils.transform_utils as T
 from robosuite.controllers import load_composite_controller_config
 import mujoco
-from scipy.optimize import minimize
+import osqp
+from scipy import sparse
 
 # Set identical global random seed to replicate dirt positions
 SEED = 15
@@ -203,59 +204,51 @@ def get_eef_wrench_from_ft_sensor(env, robot,
     
     return np.concatenate([force_world, torque_world])
 
-
 def get_joint_dynamics(robot):
     """Returns joint-space inertia matrix M and bias forces h (Coriolis + Gravity)."""
     qpos = robot.sim.data.qpos[robot._ref_joint_pos_indexes]
     qvel = robot.sim.data.qvel[robot._ref_joint_vel_indexes]
     
-    # Joint mass matrix M (7x7)
     M = np.zeros((robot.dof, robot.dof))
     mujoco.mj_fullM(robot.sim.model._model, M, robot.sim.data.qM)
     M = M[np.ix_(robot._ref_joint_vel_indexes, robot._ref_joint_vel_indexes)]
     
-    # Bias forces h = C(q, dq)*dq + g(q)
     h = robot.sim.data.qfrc_bias[robot._ref_joint_vel_indexes].copy()
     return M, h
 
 def get_operational_space_matrices(J, M):
-    """
-    Computes Operational Space Mass Matrix Lambda and dynamically consistent pseudo-inverse J_bar.
-    Lambda = (J * M^-1 * J^T)^-1
-    """
+    """Computes Operational Space Mass Matrix Lambda and dynamically consistent pseudo-inverse J_bar."""
     M_inv = np.linalg.inv(M)
     Lambda_inv = J @ M_inv @ J.T
     
-    # Regularization for stability near singularities
     Lambda = np.linalg.pinv(Lambda_inv, rcond=1e-4)
-    J_bar = M_inv @ J.T @ Lambda  # Dynamically consistent pseudo-inverse
-    N = np.eye(M.shape[0]) - J.T @ J_bar.T  # Null-space projection operator
+    J_bar = M_inv @ J.T @ Lambda  
+    N = np.eye(M.shape[0]) - J.T @ J_bar.T  
     return Lambda, J_bar, N
 
 # ------------------------------------------------------------------
-# 4. Controller Definition
+# 4. Controller Definition (Exact C++ Normal Contact Dynamics Step)
 # ------------------------------------------------------------------
-import numpy as np
-import osqp
-from scipy import sparse
-
 class Unified_CBF_CLF_Controller:
     """
-    Unified QP solver using OSQP optimizing displacement rate u_z, 
-    stiffness derivatives u_K = d(Kp)/dt, and slack delta.
-    Decision vector: y = [u_z, u_K_x, u_K_y, u_K_z, delta]^T
-    """
+    Unified QP solver using OSQP matching C++ normal contact dynamic formulation:
+    Decision vector: y = [u_n, u_K_x, u_K_y, u_K_z, delta]^T
+    """      
+
     def __init__(self, 
-                 desired_force=0.90,
-                 max_allowed_force=1.0,
-                 lambda_clf=10.0,
-                 gamma_cbf_force=15.0,
-                 gamma_cbf_pos=100.0,
-                 gamma_k=5.0,
+                 desired_force=3.0,
+                 max_allowed_force=5.0,
+                 lambda_clf=0.5,
+                 gamma_cbf_force=1.0,
+                 gamma_cbf_pos=1.0,
+                 gamma_k=0.5,
                  p_gains=(10.0, 0.1),
                  w_slack=1e4,
-                 w_k=0.1,
-                 surface_stiffness=400.0):
+                 w_k=100,
+                 surface_stiffness=400.0,
+                 d_safe=0.003,
+                 F_threshold=1.0,
+                 alpha_filter=0.3):
         
         self.desired_force = desired_force
         self.max_allowed_force = max_allowed_force
@@ -266,18 +259,27 @@ class Unified_CBF_CLF_Controller:
         self.w_slack = w_slack
         self.w_k = w_k
         self.Ks = surface_stiffness
+        self.d_safe = d_safe
+        self.F_threshold = F_threshold
+        self.alpha_filter = alpha_filter
         
-        self.P_gain = np.diag([p_gains[0], p_gains[1]])
+        # P matrix gain entries p11, p12, p22 matching CPP
+        self.p11 = float(p_gains[0])
+        self.p12 = 0.0
+        self.p22 = float(p_gains[1])
+        
         self.integral_error = 0.0
         self.downward_offset = 0.0
         self.filtered_force = 0.0
-        self.alpha = 0.3
+        self.normal_vec_prev = np.array([0.0, 0.0, 1.0])
+        self.enable_u_n_opt = True
         
         self.force_errors = []
         self.force_outputs = []
 
-        # CHANGE 1: Pre-allocate static diagonal matrix P for OSQP cost (0.5 * y^T P y)
         self.P_mat = sparse.csc_matrix(np.diag([1.0, self.w_k, self.w_k, self.w_k, self.w_slack]))
+        self.prob = osqp.OSQP()
+        self.solver_initialized = False
 
     def update(self, 
                current_force, 
@@ -292,122 +294,152 @@ class Unified_CBF_CLF_Controller:
                desired_penetration=0.003, 
                dt=0.005):
 
-        # 1. Ensure normal vector is unit length
-        n = normal_vec / (np.linalg.norm(normal_vec) + 1e-8)
+        safe_dt = max(dt, 1e-4)
 
-        # Force measurement along normal direction (scalar)
+        # 1. Normal vector unitization & force calculation along normal direction
+        n = normal_vec / (np.linalg.norm(normal_vec) + 1e-8)
         current_force_n = float(np.dot(current_force, n))
         
-        # Filter Force Measurement
-        self.filtered_force = self.alpha * abs(current_force_n) + (1 - self.alpha) * self.filtered_force
-        measured_force = self.filtered_force
+        # Filter Force Measurement matching C++ filter
+        measured_force = self.alpha_filter * current_force_n + (1.0 - self.alpha_filter) * self.filtered_force
+        self.filtered_force = measured_force
         
-        # 2. Tracking Error State x = [e_F, integral_e_F]^T
+        # 2. Tracking Error State
         e_F = self.desired_force - measured_force
-        self.integral_error = np.clip(self.integral_error + e_F * dt, -1.0, 1.0)
-        x_state = np.array([e_F, self.integral_error])
+        in_contact = (measured_force > self.F_threshold)
+        if in_contact:
+            self.integral_error = np.clip(self.integral_error + e_F * safe_dt, -1.0, 1.0)
+        else:
+            self.integral_error = 0.0
+        e_I = self.integral_error
         
-        # Position tracking error along normal direction
-        e_n = float(np.dot(x_desired - x_current, n))
-        
-        # Effective stiffness along normal direction: K_n = n^T * Kp * n
-        K_n = float(np.dot(n**2, Kp_curr))
-        
-        # 3. Lie Derivatives for Force CLF
-        V = 0.5 * float(x_state.T @ self.P_gain @ x_state)
-        LfV = float(self.P_gain[1, 1] * x_state[1] * x_state[0])
-        
-        # Coefficient for normal velocity u_n in CLF
-        LgV_un = -self.P_gain[0, 0] * (self.Ks + K_n) * e_F
-        
-        # Coefficient vector for u_K in CLF
-        LgV_uK = self.P_gain[0, 0] * e_F * e_n * (n**2)
+        # 3. Exact Normal Contact Dynamic Terms (Equations 35-39 from C++ controller)
+        n_sq = n**2
+        K_n = max(10.0, float(np.dot(n_sq, Kp_curr)))
+        K_s = self.Ks
+        K_e = (K_s * K_n) / (K_s + K_n)
 
-        # 4. Force & Position CBF terms
-        h_force = self.max_allowed_force - measured_force
+        s_r = (measured_force / K_e) if (K_e > 1e-4) else 0.0
+
+        n_dot = (n - self.normal_vec_prev) / safe_dt
+        self.normal_vec_prev = n.copy()
+
+        v_s = 0.0  # Rigid surface assumption
+        a_F = K_e
+        b_F = (s_r * K_s * K_s / ((K_s + K_n) ** 2)) * n_sq
+        f_F = K_e * v_s + 2.0 * (s_r * K_s * K_s / ((K_s + K_n) ** 2)) * float(np.dot(n_dot, Kp_curr * n))
+
+        # 4. Strict CLF Lie Derivatives matching C++ formulation
+        V_F = 0.5 * (self.p11 * e_F * e_F + 2.0 * self.p12 * e_F * e_I + self.p22 * e_I * e_I)
+        chi_F = self.p11 * e_F + self.p12 * e_I
+        psi_F = self.p12 * e_F + self.p22 * e_I
+
+        F_d_dot = 0.0
+        Lf_VF = chi_F * (F_d_dot - f_F) + psi_F * e_F
+        Lgn_VF = -chi_F * a_F
+        LgK_VF = -chi_F * b_F
+
+        # 5. Barrier Terms
+        h_F = self.max_allowed_force - measured_force
         
         if surface_point is None:
             surface_point = x_desired
 
         distance_normal = float(np.dot(x_current - surface_point, n))
-        h_pos = distance_normal + desired_penetration
+        h_P = distance_normal + self.d_safe
 
-        # =====================================================================
-        # CHANGE 2: Replace Scipy Objective & Constraints with OSQP Matrices
-        # =====================================================================
-
-        # Linear cost vector: q = [0, -w_k * u_K_ref, 0]
+        # 6. Linear cost vector: q = [0, -w_k * u_K_ref, 0]
         q = np.concatenate([[0.0], -self.w_k * u_K_ref, [0.0]])
 
-        # Construct Matrix A for constraints (l <= A * y <= u)
-        # 1. CLF: LgV_un * u_n + LgV_uK . u_K - delta <= -lambda * V - LfV
-        row_clf = [LgV_un, LgV_uK[0], LgV_uK[1], LgV_uK[2], -1.0]
-        
-        # 2. Force CBF: (Ks + Kn) * u_n - e_n * (n^2 . u_K) >= -gamma_f * h_force
-        row_force_cbf = [(self.Ks + K_n), -e_n * (n[0]**2), -e_n * (n[1]**2), -e_n * (n[2]**2), 0.0]
-        
-        # 3. Position CBF: -u_n >= -gamma_p * h_pos
+        # Construct Constraint Matrix A (l <= A * y <= u)
+        # Row 0: Relaxed Force CLF
+        row_clf = [Lgn_VF, LgK_VF[0], LgK_VF[1], LgK_VF[2], -1.0]
+        # Row 1: Upper Force CBF: -a_F * u_n - b_F . u_K >= f_F - gamma_f * h_F
+        row_force_cbf = [-a_F, -b_F[0], -b_F[1], -b_F[2], 0.0]
+        # Row 2: Surface Penetration CBF: -u_n >= -gamma_p * h_P
         row_pos_cbf = [-1.0, 0.0, 0.0, 0.0, 0.0]
-
-        # 4. Slack Non-Negativity: delta >= 0
+        # Row 3: Slack Non-Negativity: delta >= 0
         row_slack = [0.0, 0.0, 0.0, 0.0, 1.0]
-
-        # 5. Stiffness Bounds (3 rows for u_K_x, u_K_y, u_K_z)
+        # Row 4: Normal Velocity Command u_n Hard Box Bound
+        row_u_n = [1.0, 0.0, 0.0, 0.0, 0.0]
+        # Rows 5-7: Stiffness Rate Bounds (u_K)
         stiff_A = np.hstack([np.zeros((3, 1)), np.eye(3), np.zeros((3, 1))])
 
-        # Combine all constraint rows
         A_dense = np.vstack([
             row_clf,
             row_force_cbf,
             row_pos_cbf,
             row_slack,
+            row_u_n,
             stiff_A
         ])
         A = sparse.csc_matrix(A_dense)
 
-        # Bounds l and u
+        max_u_n = 0.05  # Bound matching C++ setup [m/s]
         l = np.array([
             -np.inf,
-            -self.gamma_cbf_force * h_force,
-            -self.gamma_cbf_pos * h_pos,
+            f_F - self.gamma_cbf_force * h_F,
+            -self.gamma_cbf_pos * h_P,
             0.0,
+            -max_u_n,
             -self.gamma_k * (Kp_curr[0] - K_min_vec[0]),
             -self.gamma_k * (Kp_curr[1] - K_min_vec[1]),
             -self.gamma_k * (Kp_curr[2] - K_min_vec[2])
         ])
 
         u = np.array([
-            -self.lambda_clf * V - LfV,
+            -self.lambda_clf * V_F - Lf_VF,
             np.inf,
             np.inf,
             np.inf,
+            max_u_n,
             self.gamma_k * (K_max_vec[0] - Kp_curr[0]),
             self.gamma_k * (K_max_vec[1] - Kp_curr[1]),
             self.gamma_k * (K_max_vec[2] - Kp_curr[2])
         ])
 
-        # Setup and solve OSQP problem
-        prob = osqp.OSQP()
-        prob.setup(self.P_mat, q, A, l, u, verbose=False, eps_abs=1e-5, eps_rel=1e-5)
-        res = prob.solve()
+        # 7. Setup & Solve OSQP Problem
+        if not self.solver_initialized:
+            self.prob.setup(self.P_mat, q, A, l, u, verbose=False, eps_abs=1e-5, eps_rel=1e-5)
+            self.solver_initialized = True
+        else:
+            self.prob.update(q=q, l=l, u=u)
+            self.prob.update(Ax=A.data)
 
-        # Parse OSQP results
+        res = self.prob.solve()
+
         if res.info.status == 'solved':
             u_n_opt = res.x[0]
             u_K_opt = res.x[1:4]
         else:
-            # Fallback if QP fails
-            u_n_opt = max(0.0, -LgV_un)
+            u_n_opt = 0.0
             u_K_opt = np.clip(u_K_ref, -self.gamma_k * (Kp_curr - K_min_vec), self.gamma_k * (K_max_vec - Kp_curr))
 
-        # Integrate displacement offset along normal direction
-        self.downward_offset += u_n_opt * dt
-        self.downward_offset = np.clip(self.downward_offset, 0.0, 0.15)
+        if not self.enable_u_n_opt:
+            u_n_opt = 0.0
+            self.downward_offset = 0.0
+
+        # -----------------------------------------------------------------
+        # Dynamic Offset Step Scaling Based on Contact Force
+        # -----------------------------------------------------------------
+        max_step_free = 0.0006     # Max step before contact (free space)
+        max_step_contact = 0.00007 # Min step under nominal contact force
+
+        # Compute force ratio: 0.0 when at/below threshold, 1.0 when at desired force
+        force_range = max(1e-3, self.desired_force - self.F_threshold)
+        force_ratio = np.clip((measured_force - self.F_threshold) / force_range, 0.0, 1.0)
+
+        # Smoothly interpolate from free-space max step down to contact max step
+        max_offset_step = max_step_free - force_ratio * (max_step_free - max_step_contact)
+
+        offset_delta = np.clip(u_n_opt * safe_dt, -max_offset_step, max_offset_step)
+        
+        self.downward_offset += offset_delta
+        self.downward_offset = np.clip(self.downward_offset, 0.0, 0.65)
 
         self.force_errors.append(e_F)
         self.force_outputs.append(self.downward_offset)
 
-        # Project scalar offset along 3D normal direction vector
         pos_offset_3d = -self.downward_offset * n
 
         return pos_offset_3d, u_K_opt
@@ -415,55 +447,36 @@ class Unified_CBF_CLF_Controller:
 # ------------------------------------------------------------------
 # 5. Anisotropic (Per-Axis) Adaptive Gain Parameters
 # ------------------------------------------------------------------
-# Minimum stiffness per axis [x, y, z] in N/m
 K_min_vec = np.array([200.0, 300.0, 300.0])  
-
-# Maximum upper bound cap per axis in N/m
 K_max_vec = np.array([1200.0, 1200.0, 1200.0])
-
-# Allowable error boundaries per axis [m] (e.g., 3cm in X/Y, 5cm in Z)
 zeta_p_vec = np.array([0.05, 0.05, 0.05])    
-
-# Growth exponent per axis
 eta_p_vec = np.array([6.5, 6.5, 6.5])
-
-# Growth rate coefficient alpha_i per axis [N / (m * s)]
 alpha_gain_vec = np.array([500.0, 500.0, 500.0])
-
-# Restoration / decay rate lambda_i per axis [1/s]
 lambda_decay_vec = np.array([0.2, 0.2, 0.2])
+beta_gain_vec = np.array([5000.0, 5000.0, 5000.0])  
 
-beta_gain_vec = np.array([5000.0, 5000.0, 5000.0])  # Adjust per-axis weights as needed
-
-# Initial adaptive stiffness state vector
 Kp_pos_vec = K_min_vec.copy()
 
-# Orientation gains (kept stable)
 Kp_ori_val = 800.0
 Kd_ori_val = 25.0 * np.sqrt(Kp_ori_val)
 
-eef_id = get_eef_site_id(robot)
-eef_name = robot.sim.model.site_id2name(eef_id)
-
-# Contact Blending Parameters
-k_c = 20.0                 # Sharpness gain for contact transition
-F_threshold = 0.2          # Force threshold [N] for contact detection
+k_c = 20.0                 
+F_threshold = 0.2          
 
 # ------------------------------------------------------------------
 # 6. Initialize Controller & Loggers
 # ------------------------------------------------------------------
 force_ctrl = Unified_CBF_CLF_Controller(
-    desired_force=0.9,
-    max_allowed_force=1.0,
-    lambda_clf=10.0,
-    gamma_cbf_force=15.0,
-    gamma_cbf_pos=100.0,
-    gamma_k=5.0,         # CBF convergence rate for stiffness bounds
-    p_gains=(1.0, 0.5),
+    desired_force=3.0,
+    max_allowed_force=5.0,
+    lambda_clf=0.5,
+    gamma_cbf_force=1.0,
+    gamma_cbf_pos=1.0,
+    gamma_k=0.5,         
+    p_gains=(10.0, 0.1),
     w_slack=1e4,
-    w_k=0.01             # Weight parameter w_K for stiffness reference tracking
+    w_k=100             
 )
-
 
 desired_force_list = []
 desired_pos_list = []
@@ -483,17 +496,20 @@ tau_task_list = []
 tau_total_list = []
 tau_joints_list = []
 
-
 kp_pos_list = []
 kp_ori_list = []
-u_K_ref_list = []  # NEW: Store reference stiffness rates
-u_K_opt_list = []  # NEW: Store optimized stiffness rates
+u_K_ref_list = []  
+u_K_opt_list = []  
 
 TOOL_MASS = 0.3
 TOOL_COM_EEF = np.array([0, 0, 0.02])
+
 # ------------------------------------------------------------------
 # 7. Trajectory Replay Loop
 # ------------------------------------------------------------------
+eef_id = get_eef_site_id(robot)
+eef_name = robot.sim.model.site_id2name(eef_id)
+
 step_idx = 0
 print("\nStarting Force-Controlled Impedance Tracking Replay...")
 print("="*110)
@@ -538,68 +554,45 @@ try:
         # 1. Contact State
         # ----------------------------------------------------------
         F_z = abs(force_ctrl.filtered_force)
-
-        # Compute continuous contact state gamma(f_z)
         gamma = 1.0 / (1.0 + np.exp(-k_c * (F_z - F_threshold)))
         gamma_list.append(gamma)
 
         # ----------------------------------------------------------
         # 2. Dynamic Adaptive Stiffness Reference Rate u_K_ref
         # ----------------------------------------------------------
-        dt_step = 0.005  # Integration time step [s]
+        dt_step = 0.005  
 
-        # Element-wise Cartesian position error vector using nominal trajectory
         e_p_vec = x_desired - x_current
         e_p_abs = np.abs(e_p_vec)
 
-        # 1. Compute surface normal vector and directional weights
         R_s = T.quat2mat(q_desired)
         normal_vec = -R_s[:, 2]
         n = normal_vec / (np.linalg.norm(normal_vec) + 1e-8)
-        n_sq = n**2  # Directional projection weights (n_x^2, n_y^2, n_z^2)
+        n_sq = n**2  
 
-        # 2. Project scalar contact state gamma across Cartesian axes based on normal orientation
-        # n_sq smoothly distributes gamma to X, Y, Z based on tilt
         gamma_vec = gamma * n_sq
 
-        # 3. Position error term (Free-space tracking)
-        e_p_vec = x_desired - x_current
-        e_p_abs = np.abs(e_p_vec)
         scaled_error = (e_p_abs / zeta_p_vec) ** eta_p_vec
         growth_term = np.log(1.0 + scaled_error)
 
-        # 4. Force ratio term (Normal contact adaptation)
-        # Measured normal force scalar
         F_measured = force_ctrl.filtered_force
         F_d = force_ctrl.desired_force
         force_ratio_term = (F_d - F_measured) / F_d
         desired_force_list.append(F_d)
 
-        # 5. Corrected u_K_ref calculation
-        # - Free-space growth is active tangentially: (1.0 - gamma_vec)
-        # - Force adaptation scales with normal projection: gamma_vec * force_ratio_term
         u_K_ref = (
             -lambda_decay_vec * (Kp_pos_vec - K_min_vec)
             + (1.0 - gamma_vec) * alpha_gain_vec * growth_term
             + gamma_vec * beta_gain_vec * force_ratio_term
         )
 
-        # Store reference stiffness rates
         u_K_ref_list.append(u_K_ref.copy())
 
-
-
-        # Extract end-effector orientation matrix and normal vector
-        R_s = T.quat2mat(q_desired)
-        normal_vec = -R_s[:, 2]  # Z-axis of end-effector frame pointing toward surface
-
-        # Extract 3D measured force from sensor wrench
         ee_force_world = ee_wrench_world[:3]
 
         # ----------------------------------------------------------
         # 3. Unified QP Solve along End-Effector Normal
         # ----------------------------------------------------------
-
         pos_offset_3d, u_K_opt = force_ctrl.update(
             current_force=ee_force_world,
             x_current=x_current,
@@ -609,31 +602,24 @@ try:
             u_K_ref=u_K_ref,
             K_min_vec=K_min_vec,
             K_max_vec=K_max_vec,
-            surface_point=x_desired,       # Local surface target point
-            desired_penetration=0.003,    # Max allowed penetration limit [m]
+            surface_point=x_desired,       
+            desired_penetration=0.003,    
             dt=dt_step
         )
 
-        # Store outputs
         u_K_opt_list.append(u_K_opt.copy())
         force_correction_list.append(np.linalg.norm(pos_offset_3d))
         force_error_list.append(force_ctrl.force_errors[-1] if force_ctrl.force_errors else 0)
         position_offset_list.append(np.linalg.norm(pos_offset_3d))
 
-        # Apply 3D normal offset to target position vector
         x_desired_modified = x_desired + pos_offset_3d
 
-        # Integrate optimal stiffness rate u_K_opt
         Kp_pos_vec += u_K_opt * dt_step
         Kd_pos_vec = 20.0 * np.sqrt(Kp_pos_vec)
 
-        
-        # Section 7 inside the while loop (around line 570)
         kp_pos_list.append(Kp_pos_vec.copy())
-        kp_ori_list.append(np.array([Kp_ori_val, Kp_ori_val, Kp_ori_val]))  # <-- FIX: store 3D vector
+        kp_ori_list.append(np.array([Kp_ori_val, Kp_ori_val, Kp_ori_val]))  
 
-
-        # Construct dynamic diagonal gain matrices
         Kp_pos = np.diag(Kp_pos_vec)
         Kd_pos = np.diag(Kd_pos_vec)
         Kp_ori = np.diag([Kp_ori_val, Kp_ori_val, Kp_ori_val])
@@ -643,7 +629,7 @@ try:
         Kd = np.block([[Kd_pos, np.zeros((3, 3))], [np.zeros((3, 3)), Kd_ori]])
 
         # ----------------------------------------------------------
-        # 3. Impedance Control & Actuation
+        # 4. Impedance Control & Actuation
         # ----------------------------------------------------------
         pos_error = x_desired_modified - x_current
         ori_error = T.get_orientation_error(q_desired, quat_current)
@@ -660,33 +646,23 @@ try:
         J = np.vstack([J_pos, J_rot])
         dx = J @ dq
 
-        # 1. Fetch joint dynamics M(q) and h(q, dq)
         M_q, h_q = get_joint_dynamics(robot)
-        
-        # 2. Operational-Space Inertia Matrix Lambda(q) and Null-space matrix N(q)
         Lambda, J_bar, N = get_operational_space_matrices(J, M_q)
 
-        # Null-space joint velocity damping to stabilize internal degrees of freedom
-        K_null = 500.0 * np.eye(robot.dof)
+        K_null = 3.0 * np.eye(robot.dof)
         tau_null = N @ (-K_null @ dq)
 
         F_task = Kp @ cartesian_error - Kd @ dx
         tau_task = J.T @ F_task
 
         tau_total = tau_task + h_q + tau_null
-
-        # --- ADD THIS LINE TO CLIP TORQUES ---
         tau_total = np.clip(tau_total, -max_torque, max_torque)
-        # --------------------------------------
-
-        tau_task_list.append(np.linalg.norm(tau_task))
 
         tau_task_list.append(np.linalg.norm(tau_task))
         tau_total_list.append(np.linalg.norm(tau_total))
         tau_joints_list.append(tau_total.copy())
 
         normalized_action = np.clip(tau_total / max_torque, -1.0, 1.0)
-
         action = np.concatenate([normalized_action, [-1.0]]) if env.action_dim > 7 else normalized_action
 
         obs, reward, done, info = env.step(action)
@@ -704,7 +680,6 @@ except KeyboardInterrupt:
 # ------------------------------------------------------------------
 # 8. Plotting Summary
 # ------------------------------------------------------------------
-# Safely close the environment and destroy OpenGL contexts first to prevent GLX collisions
 try:
     env.close()
     if hasattr(env, "viewer") and env.viewer is not None:
@@ -724,26 +699,17 @@ if len(actual_pos_list) > 0:
     force_corr = np.array(force_correction_list)
     pos_offset = np.array(position_offset_list)
     gamma = np.array(gamma_list)
-    kp_pos_arr = np.array(kp_pos_list)      # (N, 3) -> [Kp_x, Kp_y, Kp_z]
-    kp_ori_arr = np.array(kp_ori_list)      # (N, 3) -> [Kp_roll, Kp_pitch, Kp_yaw]
-    u_K_ref_arr = np.array(u_K_ref_list)    # (N, 3)
-    u_K_opt_arr = np.array(u_K_opt_list)    # (N, 3)
-    tau_joints_arr = np.atleast_2d(np.array(tau_joints_list))  # Ensure 2D (N, 7) array shape
+    kp_pos_arr = np.array(kp_pos_list)      
+    kp_ori_arr = np.array(kp_ori_list)      
+    u_K_ref_arr = np.array(u_K_ref_list)    
+    u_K_opt_arr = np.array(u_K_opt_list)    
+    tau_joints_arr = np.atleast_2d(np.array(tau_joints_list))  
 
     time_steps = np.arange(len(actual_pos)) * 0.005
-
-
-
-    # Calculate integrated reference stiffness: K_p_ref(t) = K_min + integral(u_K_ref * dt)
-    dt_step = 0.005
     kp_ref_integrated = K_min_vec + np.cumsum(u_K_ref_arr * dt_step, axis=0)
 
-
-    # ------------------------------------------------------------------
-    # Figure 1: 8-Subplot Grid for Task-Space Metrics
-    # ------------------------------------------------------------------
     fig1, axes = plt.subplots(9, 1, figsize=(10, 27), sharex=True)
-    # Subplot 1: EE Position
+    
     pos_colors, pos_labels = ["crimson", "limegreen", "royalblue"], ["X", "Y", "Z"]
     for i in range(3):
         axes[0].plot(time_steps, desired_pos[:, i], "--", color=pos_colors[i], alpha=0.7, label=f"Desired {pos_labels[i]}")
@@ -752,7 +718,6 @@ if len(actual_pos_list) > 0:
     axes[0].grid(True, linestyle="--", alpha=0.6)
     axes[0].legend(loc="upper right", ncol=3, fontsize=8)
 
-    # Subplot 2: Orientation Quaternion
     quat_colors, quat_labels = ["darkorange", "crimson", "limegreen", "royalblue"], ["qw", "qx", "qy", "qz"]
     for i in range(4):
         axes[1].plot(time_steps, desired_quat[:, i], "--", color=quat_colors[i], alpha=0.7, label=f"Desired {quat_labels[i]}")
@@ -761,27 +726,23 @@ if len(actual_pos_list) > 0:
     axes[1].grid(True, linestyle="--", alpha=0.6)
     axes[1].legend(loc="upper right", ncol=4, fontsize=8)
 
-    # Subplot 3: Z Force Tracking
     axes[2].plot(time_steps, force_z, "b-", label="Measured Fz")
     axes[2].plot(time_steps, desired_force_arr, "r--", label="Target Sinusoidal Force")
     axes[2].set_ylabel("Z Force [N]")
     axes[2].grid(True, linestyle="--", alpha=0.6)
     axes[2].legend(loc="upper right", fontsize=8)
 
-    # Subplot 4: CBF/CLF Correction
     axes[3].plot(time_steps, force_corr, "purple", label="CBF/CLF Output [m]")
     axes[3].set_ylabel("Force Correction [m]")
     axes[3].grid(True, linestyle="--", alpha=0.6)
     axes[3].legend(loc="upper right", fontsize=8)
 
-    # Subplot 5: Blended Offset & Gamma
     axes[4].plot(time_steps, pos_offset * 1000, "teal", label="Blended Offset [mm]")
     axes[4].plot(time_steps, gamma * 100, "g--", label="Gamma (%)")
     axes[4].set_ylabel("Offset / Gamma")
     axes[4].grid(True, linestyle="--", alpha=0.6)
     axes[4].legend(loc="upper right", fontsize=8)
 
-    # Subplot 6: Translational Stiffness Gains (Kp_pos)
     axes[5].plot(time_steps, kp_pos_arr[:, 0], color="crimson", label="Kp_x")
     axes[5].plot(time_steps, kp_pos_arr[:, 1], color="limegreen", label="Kp_y")
     axes[5].plot(time_steps, kp_pos_arr[:, 2], color="royalblue", label="Kp_z")
@@ -789,7 +750,6 @@ if len(actual_pos_list) > 0:
     axes[5].grid(True, linestyle="--", alpha=0.6)
     axes[5].legend(loc="upper right", ncol=3, fontsize=8)
 
-    # Subplot 7: Orientation Stiffness Gains (Kp_ori)
     ori_colors = ["darkorange", "purple", "brown"]
     ori_labels = ["Roll (X)", "Pitch (Y)", "Yaw (Z)"]
     for i in range(3):
@@ -798,8 +758,6 @@ if len(actual_pos_list) > 0:
     axes[6].grid(True, linestyle="--", alpha=0.6)
     axes[6].legend(loc="upper right", ncol=3, fontsize=8)
 
-
-    # Subplot 8: Stiffness Rates (u_K)
     colors = ["crimson", "limegreen", "royalblue"]
     axis_names = ["X", "Y", "Z"]
     for i in range(3):
@@ -809,7 +767,6 @@ if len(actual_pos_list) > 0:
     axes[7].grid(True, linestyle="--", alpha=0.6)
     axes[7].legend(loc="upper right", ncol=3, fontsize=8)
 
-    # Subplot 9: Integrated Reference Stiffness vs Actual
     for i in range(3):
         axes[8].plot(time_steps, kp_ref_integrated[:, i], "--", color=colors[i], alpha=0.7, label=f"Integrated Kp_ref_{axis_names[i]}")
         axes[8].plot(time_steps, kp_pos_arr[:, i], "-", color=colors[i], linewidth=1.5, label=f"Actual Kp_opt_{axis_names[i]}")
@@ -821,11 +778,6 @@ if len(actual_pos_list) > 0:
     fig1.tight_layout()
     fig1.savefig("cbf_clf_wiping_results.png", dpi=300)
 
-    fig1.tight_layout()
-    fig1.savefig("cbf_clf_wiping_results.png", dpi=300)
-    # ------------------------------------------------------------------
-    # Figure 2: Standalone Joint Control Torques (7-DoF Panda)
-    # ------------------------------------------------------------------
     fig2, ax2 = plt.subplots(figsize=(10, 5))
     joint_colors = ["crimson", "darkorange", "goldenrod", "limegreen", "teal", "royalblue", "purple"]
 
@@ -845,5 +797,4 @@ if len(actual_pos_list) > 0:
     fig2.tight_layout()
     fig2.savefig("joint_torques_standalone.png", dpi=300)
 
-    # Explicitly show both GUI figure windows concurrently
     plt.show(block=True)
