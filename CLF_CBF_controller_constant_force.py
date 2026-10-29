@@ -437,7 +437,7 @@ class Unified_CBF_CLF_Controller:
             u_n_opt = 0.01  # [m/s] minimum approach rate
 
         # Dynamic Offset Step Scaling
-        max_step_free = 0.05     
+        max_step_free = 0.09     
         max_step_contact = 0.007 
 
         force_range = max(1e-3, self.desired_force - self.F_threshold)
@@ -702,7 +702,7 @@ try:
         M_q, h_q = get_joint_dynamics(robot)
         Lambda, J_bar, N = get_operational_space_matrices(J, M_q)
 
-        K_null = 500.0 * np.eye(robot.dof)
+        K_null = 3.0 * np.eye(robot.dof)
         tau_null = N @ (-K_null @ dq)
 
         F_task = Kp @ cartesian_error - Kd @ dx
