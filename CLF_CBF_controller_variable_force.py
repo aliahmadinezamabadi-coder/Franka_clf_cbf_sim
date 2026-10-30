@@ -463,7 +463,7 @@ class Unified_CBF_CLF_Controller:
 # ------------------------------------------------------------------
 # Translational Parameters
 K_min_vec = np.array([200.0, 300.0, 300.0])  
-K_max_vec = np.array([1200.0, 1200.0, 1200.0])
+K_max_vec = np.array([1000.0, 1000.0, 1000.0])
 zeta_p_vec = np.array([0.05, 0.05, 0.05])    
 eta_p_vec = np.array([6.5, 6.5, 6.5])
 alpha_gain_vec = np.array([500.0, 500.0, 500.0])
