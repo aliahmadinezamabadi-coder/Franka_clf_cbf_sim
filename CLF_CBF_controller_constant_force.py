@@ -244,7 +244,7 @@ class Unified_CBF_CLF_Controller:
     """      
 
     def __init__(self, 
-                 desired_force=3.0,
+                 desired_force=2.0,
                  max_allowed_force=5.0,
                  lambda_clf=0.5,
                  gamma_cbf_force=1.0,
@@ -254,7 +254,7 @@ class Unified_CBF_CLF_Controller:
                  w_slack=1e4,
                  w_k=100.0,
                  surface_stiffness=400.0,
-                 d_safe=0.003,
+                 d_safe=0.05,
                  F_threshold=1.0,
                  alpha_filter=0.3):
         
@@ -462,7 +462,7 @@ class Unified_CBF_CLF_Controller:
 # ------------------------------------------------------------------
 # Translational Parameters
 K_min_vec = np.array([200.0, 300.0, 300.0])  
-K_max_vec = np.array([1200.0, 1200.0, 1200.0])
+K_max_vec = np.array([500.0, 500.0, 500.0])
 zeta_p_vec = np.array([0.05, 0.05, 0.05])    
 eta_p_vec = np.array([6.5, 6.5, 6.5])
 alpha_gain_vec = np.array([500.0, 500.0, 500.0])
@@ -487,7 +487,7 @@ F_threshold = 0.2
 # 6. Initialize Controller & Loggers
 # ------------------------------------------------------------------
 force_ctrl = Unified_CBF_CLF_Controller(
-    desired_force=1.0,
+    desired_force=2.0,
     max_allowed_force=8.0,
     lambda_clf=0.5,
     gamma_cbf_force=1.0,
