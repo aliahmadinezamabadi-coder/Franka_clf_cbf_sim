@@ -462,7 +462,7 @@ class Unified_CBF_CLF_Controller:
 # ------------------------------------------------------------------
 # Translational Parameters
 K_min_vec = np.array([200.0, 300.0, 300.0])  
-K_max_vec = np.array([2000.0, 2000.0, 2000.0])
+K_max_vec = np.array([1000.0, 1000.0, 1000.0])
 zeta_p_vec = np.array([0.05, 0.05, 0.05])    
 eta_p_vec = np.array([6.5, 6.5, 6.5])
 alpha_gain_vec = np.array([500.0, 500.0, 500.0])
@@ -781,7 +781,7 @@ if len(actual_pos_list) > 0:
 
     axes[2].plot(time_steps, force_z, "b-", label="Measured Fz")
     axes[2].plot(time_steps, desired_force_arr, "r--", label="Target Sinusoidal Force")
-    axes[2].set_ylabel("Z Force [N]")
+    axes[2].set_ylabel("Normal Contact Force [N]")
     axes[2].grid(True, linestyle="--", alpha=0.6)
     axes[2].legend(loc="upper right", fontsize=8)
 

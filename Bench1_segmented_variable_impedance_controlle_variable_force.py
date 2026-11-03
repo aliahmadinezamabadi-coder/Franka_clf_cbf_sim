@@ -218,29 +218,32 @@ def get_joint_dynamics(robot):
 # ------------------------------------------------------------------
 # 4. ART-AVIC Controller Class (Wang et al., 2027)
 # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 4. ART-AVIC Controller Class (Wang et al. - Fixed for Dynamic F_d)
+# ------------------------------------------------------------------
 class ART_AVIC_Controller:
     """
-    Adaptive Reference Trajectory & Adaptive Variable Impedance Controller (Wang et al., 2027)
+    Modified ART-AVIC Controller for Time-Varying Target Forces F_d(t).
     
-    Implements:
-    - Eq. (6) Reference trajectory adaptive adjustment: xr(t) = xr(t-T) + kx * (fd - fe)
-    - Eq. (11)-(13) Segmented damping adaptation:
-        Δb = (fe - fd) * θ * α1 * b^2   if (fd - fe) < 0  (Overshoot/High contact force)
-        Δb = (fe - fd) * θ * α2 * b     if (fd - fe) >= 0 (Undershoot/Approach stage)
-    - Eq. (11) Implemented via Cartesian Impedance command to operational space execution.
+    Includes:
+    - PI Reference Trajectory Adjustment (eliminates phase lag without high-gain instability).
+    - Anti-windup clamping on the integral trajectory offset.
+    - Leakage-augmented segmented damping adaptation (prevents damping lockup on force decrease).
+    - Analytic feedforward velocity estimation.
     """
     def __init__(self,
                  desired_force=2.0,
                  m_val=1.0,
                  b_init=40.0,
-                 k_val=400.0,
-                 kf_val=1.0,
-                 kx_val=1e-4,
-                 theta_val=0.01,
+                 k_val=500.0,
+                 kf_val=0.5,
+                 kx_p=1.0 / 1200.0,   # Proportional feedforward gain (~1/Ke)
+                 kx_i=1.0e-3,          # Integral gain for steady-state offset
+                 theta_val=0.002,      # Damping update rate
                  alpha1=0.001,
                  alpha2=0.01,
                  b_min=10.0,
-                 b_max=300.0,
+                 b_max=120.0,          # Reduced max bound to prevent chatter
                  alpha_filter=0.3):
         
         self.fd = desired_force
@@ -249,7 +252,10 @@ class ART_AVIC_Controller:
         self.b_curr = b_init
         self.k = k_val
         self.kf = kf_val
-        self.kx = kx_val
+        
+        # PI Trajectory Adaptation Gains
+        self.kx_p = kx_p
+        self.kx_i = kx_i
         
         # Damping adaptation hyperparameters
         self.theta = theta_val
@@ -261,11 +267,12 @@ class ART_AVIC_Controller:
         self.alpha_filter = alpha_filter
         self.filtered_force = 0.0
         
-        # State tracking for trajectory correction along normal
+        # Trajectory integration states
+        self.xr_integral = 0.0
         self.xr_normal_offset = 0.0
+        self.prev_fd = desired_force
 
     def update(self, current_force_world, normal_vec, desired_force=None, dt=0.005):
-        # Update target force dynamically if provided
         if desired_force is not None:
             self.fd = desired_force
 
@@ -273,28 +280,42 @@ class ART_AVIC_Controller:
         n = normal_vec / (np.linalg.norm(normal_vec) + 1e-8)
         fe_raw = float(np.dot(current_force_world, n))
         
-        # Force low-pass filtering
+        # Exponential force filtering
         fe = self.alpha_filter * fe_raw + (1.0 - self.alpha_filter) * self.filtered_force
         self.filtered_force = fe
         
         # Force error e_f = fd - fe
         e_f = self.fd - fe
         
-        # 2. Reference Trajectory Adaptive Adjustment Law - Eq. (6)
-        delta_xr = self.kx * e_f
-        self.xr_normal_offset += delta_xr
+        # 2. Reference Trajectory Adaptation with PI & Anti-Windup
+        # Integral accumulator with clamping
+        self.xr_integral += e_f * dt
+        self.xr_integral = np.clip(self.xr_integral, -0.05, 0.05)
         
-        # 3. Segmented Damping Update Law - Eq. (12)
+        # Proportional-Integral Trajectory Adjustment Law
+        self.xr_normal_offset = self.kx_p * e_f + self.kx_i * self.xr_integral
+        
+        # Bound max positional deformation offset safety limit
+        self.xr_normal_offset = np.clip(self.xr_normal_offset, -0.1, 0.1)
+        
+        # 3. Segmented Damping Update Law with Leakage Decay
         if e_f < 0:
+            # High force / overshoot: increase damping to dissipate kinetic energy
             delta_b = (fe - self.fd) * self.theta * self.alpha1 * (self.b_curr ** 2)
         else:
+            # Low force: decrease damping towards nominal baseline
             delta_b = (fe - self.fd) * self.theta * self.alpha2 * self.b_curr
             
-        # Update actual damping parameter B = b + Δb - Eq. (13)
-        self.b_curr = np.clip(self.b_curr + delta_b, self.b_min, self.b_max)
+        # Add a relaxation term toward b_base to un-wind damping on cyclic force drops
+        leakage = 0.05 * (self.b_base - self.b_curr)
+        self.b_curr = np.clip(self.b_curr + delta_b + leakage, self.b_min, self.b_max)
+        
+        # Feedforward force derivative
+        fd_dot = (self.fd - self.prev_fd) / dt
+        self.prev_fd = self.fd
         
         pos_offset_3d = -self.xr_normal_offset * n
-        return pos_offset_3d, self.b_curr, fe, e_f
+        return pos_offset_3d, self.b_curr, fe, e_f, fd_dot
 
 # ------------------------------------------------------------------
 # 5. Initialize Controller & Loggers
@@ -312,15 +333,17 @@ omega  = 2.0 * np.pi * F_freq
 controller = ART_AVIC_Controller(
     desired_force=2.0,
     m_val=1.0,
-    b_init=50.0,
+    b_init=40.0,
     k_val=500.0,
-    kf_val=1.0,
-    kx_val=1.5e-4,       # Reference trajectory adaptation gain
-    theta_val=0.005,      # Damping update rate
-    alpha1=0.002,         # Damping update param 1
-    alpha2=0.02,          # Damping update param 2
+    kf_val=0.5,            # Direct force feedback gain
+    kx_p=5.0 / 1200.0,     # Feedforward gain scaled by estimated table stiffness (~1200 N/m)
+    kx_i=2.2,           # Integral gain for robust trajectory tracking
+    theta_val=0.003,       # Damping update rate
+    alpha1=0.001,          # Damping boost coefficient
+    alpha2=0.01,           # Damping reduction coefficient
     b_min=10.0,
-    b_max=300.0
+    b_max=150.0,           # Upper bound on Cartesian contact damping
+    alpha_filter=0.3
 )
 
 # With the bellow parameters the controller become more accurate but aggressive and can lead to oscillations and instability in the wiping task.
@@ -360,7 +383,7 @@ TOOL_MASS = 0.3
 TOOL_COM_EEF = np.array([0, 0, 0.02])
 
 # Base Cartesian Impedance Gains
-Kp_pos_base = np.array([1000.0, 1000.0, 1000.0])
+Kp_pos_base = np.array([2000.0, 2000.0, 2000.0])
 Kp_ori_base = np.array([500.0, 500.0, 500.0])
 Kd_ori_base = 2.0 * np.sqrt(Kp_ori_base)
 
@@ -422,10 +445,10 @@ try:
         
         ee_force_world = ee_wrench_world[:3]
         
-        pos_offset_3d, b_adapted, fe_filt, force_err = controller.update(
+        pos_offset_3d, b_adapted, fe_filt, force_err, fd_dot = controller.update(
             current_force_world=ee_force_world,
             normal_vec=normal_vec,
-            desired_force=F_d_curr,   # <-- Pass dynamic target force
+            desired_force=F_d_curr,
             dt=dt_step
         )
 
@@ -434,7 +457,7 @@ try:
         position_offset_list.append(np.linalg.norm(pos_offset_3d))
         damping_b_list.append(b_adapted)
 
-        # Apply Reference Trajectory Correction Eq. (6)
+        # Apply Reference Trajectory Correction
         x_desired_modified = x_desired + pos_offset_3d
 
         # ----------------------------------------------------------
@@ -451,7 +474,8 @@ try:
         ori_error_list.append(ori_error.copy())
 
         # Anisotropic Damping Matrix (b_adapted along contact normal, base elsewhere)
-        n_sq = (normal_vec / (np.linalg.norm(normal_vec) + 1e-8)) ** 2
+        n_unit = normal_vec / (np.linalg.norm(normal_vec) + 1e-8)
+        n_sq = n_unit ** 2
         Kd_pos_vec = (1.0 - n_sq) * (2.0 * np.sqrt(Kp_pos_base)) + n_sq * b_adapted
         
         Kp_pos = np.diag(Kp_pos_base)
@@ -474,11 +498,18 @@ try:
         N = np.eye(robot.dof) - np.linalg.pinv(J) @ J
         tau_null = N @ (-3.0 * dq)
 
-        # Force Error Gain integration kf * (fd - fe) into impedance law Eq. (11)
-        F_force_feedforward = controller.kf * force_err * (normal_vec / (np.linalg.norm(normal_vec) + 1e-8))
+        # Force Error Feedforward + Velocity Feedforward Injection (fd_dot / Ke)
+        Ke_est = 1200.0
+        v_ff = (fd_dot / Ke_est) * n_unit
         
-        F_task = Kp @ cartesian_error - Kd @ dx
-        F_task[:3] += F_force_feedforward
+        F_force_feedforward = controller.kf * force_err * n_unit
+        
+        # Operational Space task force with feedforward velocity drive
+        dx_pos_err = dx[:3] - v_ff
+        F_pos_task = Kp_pos @ pos_error - Kd_pos @ dx_pos_err + F_force_feedforward
+        F_ori_task = Kp_ori @ ori_error - Kd_ori @ dx[3:]
+        
+        F_task = np.concatenate([F_pos_task, F_ori_task])
 
         tau_task = J.T @ F_task
         tau_total = tau_task + h_q + tau_null
@@ -553,7 +584,7 @@ if len(actual_pos_list) > 0:
 
     axes[2].plot(time_steps, force_z, "b-", label="Measured Fz (ART-AVIC)")
     axes[2].plot(time_steps, desired_force_arr, "r--", label=r"Target Sinusoidal Force $F_d(t)$")
-    axes[2].set_ylabel("Z Force [N]")
+    axes[2].set_ylabel("Normal Force [N]")
     axes[2].grid(True, linestyle="--", alpha=0.6)
     axes[2].legend(loc="upper right", fontsize=8)
 

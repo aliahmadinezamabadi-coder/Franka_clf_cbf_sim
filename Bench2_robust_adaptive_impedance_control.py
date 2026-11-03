@@ -325,7 +325,7 @@ TOOL_MASS = 0.3
 TOOL_COM_EEF = np.array([0, 0, 0.02])
 
 # Base Operational Space Impedance Gains
-Kp_pos_base = np.array([2000.0, 2000.0, 2000.0])
+Kp_pos_base = np.array([1500.0, 1500.0, 1500.0])
 Kd_pos_base = 2.0 * np.sqrt(Kp_pos_base)
 Kp_ori_base = np.array([500.0, 500.0, 500.0])
 Kd_ori_base = 2.0 * np.sqrt(Kp_ori_base)
@@ -495,7 +495,7 @@ if len(actual_pos_list) > 0:
 
     axes[2].plot(time_steps, force_z, "b-", label="Measured Fz (Song et al.)")
     axes[2].plot(time_steps, desired_force_arr, "r--", label="Target Force (2.0 N)")
-    axes[2].set_ylabel("Z Force [N]")
+    axes[2].set_ylabel("Normal Contact Force [N]")
     axes[2].grid(True, linestyle="--", alpha=0.6)
     axes[2].legend(loc="upper right", fontsize=8)
 
