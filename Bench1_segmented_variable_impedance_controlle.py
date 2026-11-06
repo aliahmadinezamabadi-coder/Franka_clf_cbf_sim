@@ -300,15 +300,15 @@ class ART_AVIC_Controller:
 # 5. Initialize Controller & Loggers
 # ------------------------------------------------------------------
 controller = ART_AVIC_Controller(
-    desired_force=2.0,
+    desired_force=1.0,  # Changed from 2.0 to 1.0
     m_val=1.0,
-    b_init=50.0,
-    k_val=500.0,
-    kf_val=1.0,
+    b_init=30.0,
+    k_val=150.0,
+    kf_val=10.0,
     kx_val=1.5e-4,       # Reference trajectory adaptation gain
-    theta_val=0.005,      # Damping update rate
-    alpha1=0.002,         # Damping update param 1
-    alpha2=0.02,          # Damping update param 2
+    theta_val=2,      # Damping update rate
+    alpha1=1,         # Damping update param 1
+    alpha2=1,          # Damping update param 2
     b_min=10.0,
     b_max=300.0
 )
@@ -334,7 +334,7 @@ TOOL_MASS = 0.3
 TOOL_COM_EEF = np.array([0, 0, 0.02])
 
 # Base Cartesian Impedance Gains
-Kp_pos_base = np.array([2000.0, 2000.0, 2000.0])
+Kp_pos_base = np.array([1000.0, 1000.0, 1000.0])
 Kp_ori_base = np.array([500.0, 500.0, 500.0])
 Kd_ori_base = 2.0 * np.sqrt(Kp_ori_base)
 
@@ -380,6 +380,13 @@ try:
 
         current_force_z = ee_wrench_world[2]
         force_z_list.append(current_force_z)
+
+
+        # ----------------------------------------------------------
+        # 1. Update ART-AVIC Trajectory & Damping
+        # ----------------------------------------------------------
+        current_time = step_idx * dt_step
+        controller.fd = 1.0 if current_time < 20.0 else 2.0  # Dynamic force profile
 
         # ----------------------------------------------------------
         # 1. Update ART-AVIC Trajectory & Damping
@@ -518,7 +525,7 @@ if len(actual_pos_list) > 0:
     axes[1].legend(loc="upper right", ncol=4, fontsize=8)
 
     axes[2].plot(time_steps, force_z, "b-", label="Measured Fz (ART-AVIC)")
-    axes[2].plot(time_steps, desired_force_arr, "r--", label="Target Force (2.0 N)")
+    axes[2].plot(time_steps, desired_force_arr, "r--", label="Target Force Profile")
     axes[2].set_ylabel("Z Force [N]")
     axes[2].grid(True, linestyle="--", alpha=0.6)
     axes[2].legend(loc="upper right", fontsize=8)

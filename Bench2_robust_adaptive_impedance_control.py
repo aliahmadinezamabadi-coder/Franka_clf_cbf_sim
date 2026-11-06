@@ -294,12 +294,12 @@ class SongAdaptiveCompensatorController:
 # 5. Initialize Controller & Loggers
 # ------------------------------------------------------------------
 controller = SongAdaptiveCompensatorController(
-    desired_force=2.0,    # Target contact force [N]
-    md=1.0,               # Virtual mass md = 2.0
-    bd=80.0,             # Virtual damping bd = 200.0
+    desired_force=1.0,    # Changed from 2.0 to 1.0 N
+    md=2.0,               # Virtual mass md = 2.0
+    bd=50.0,             # Virtual damping bd = 200.0
     alpha=1.0,            # alpha = 1.0
     beta=1.0e-5,          # beta = 1e-5
-    gamma=0.01,          # gamma = 0.001
+    gamma=0.1,          # gamma = 0.001
     d_init=0.0,           # d(0) = 0
     alpha_filter=0.2
 )
@@ -372,6 +372,12 @@ try:
 
         current_force_z = ee_wrench_world[2]
         force_z_list.append(current_force_z)
+
+        # ----------------------------------------------------------
+        # 1. Update Adaptive Compensator Trajectory Offset
+        # ----------------------------------------------------------
+        current_time = step_idx * dt_step
+        controller.fd = 1.0 if current_time < 20.0 else 2.0  # Dynamic force profile step at 20s
 
         # ----------------------------------------------------------
         # 1. Update Adaptive Compensator Trajectory Offset
@@ -494,7 +500,7 @@ if len(actual_pos_list) > 0:
     axes[1].legend(loc="upper right", ncol=4, fontsize=8)
 
     axes[2].plot(time_steps, force_z, "b-", label="Measured Fz (Song et al.)")
-    axes[2].plot(time_steps, desired_force_arr, "r--", label="Target Force (2.0 N)")
+    axes[2].plot(time_steps, desired_force_arr, "r--", label="Target Force Profile (1.0 N -> 2.0 N)")
     axes[2].set_ylabel("Z Force [N]")
     axes[2].grid(True, linestyle="--", alpha=0.6)
     axes[2].legend(loc="upper right", fontsize=8)

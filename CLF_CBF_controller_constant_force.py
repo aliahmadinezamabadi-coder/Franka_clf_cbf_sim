@@ -461,8 +461,8 @@ class Unified_CBF_CLF_Controller:
 # 5. Anisotropic (Per-Axis) Adaptive Gain Parameters
 # ------------------------------------------------------------------
 # Translational Parameters
-K_min_vec = np.array([200.0, 300.0, 300.0])  
-K_max_vec = np.array([2000.0, 2000.0, 2000.0])
+K_min_vec = np.array([300.0, 300.0, 300.0])  
+K_max_vec = np.array([1000.0, 1000.0, 1000.0])
 zeta_p_vec = np.array([0.05, 0.05, 0.05])    
 eta_p_vec = np.array([6.5, 6.5, 6.5])
 alpha_gain_vec = np.array([500.0, 500.0, 500.0])
@@ -487,7 +487,7 @@ F_threshold = 0.2
 # 6. Initialize Controller & Loggers
 # ------------------------------------------------------------------
 force_ctrl = Unified_CBF_CLF_Controller(
-    desired_force=2.0,
+    desired_force=1.0,  # Changed from 2.0 to 1.0
     max_allowed_force=8.0,
     lambda_clf=0.5,
     gamma_cbf_force=1.0,
@@ -576,6 +576,15 @@ try:
             force_str = f"[{ee_wrench_world[0]:.2f}, {ee_wrench_world[1]:.2f}, {ee_wrench_world[2]:.2f}]"
             torque_str = f"[{torque_tool[0]:.3f}, {torque_tool[1]:.3f}, {torque_tool[2]:.3f}]"
             print(f"{step_idx:5d} | {pos_str:>28} | {force_str:>30} | Tool Torque (Tx, Ty, Tz): {torque_str:>25}")
+
+
+        # ----------------------------------------------------------
+        # Dynamic Desired Force Profile Update (1.0 N for 0-20s, 2.0 N after 20s)
+        # ----------------------------------------------------------
+        dt_step = 0.005  
+        current_time = step_idx * dt_step
+        force_ctrl.desired_force = 1.0 if current_time < 20.0 else 2.0
+
 
         # ----------------------------------------------------------
         # 1. Contact State
@@ -780,7 +789,7 @@ if len(actual_pos_list) > 0:
     axes[1].legend(loc="upper right", ncol=4, fontsize=8)
 
     axes[2].plot(time_steps, force_z, "b-", label="Measured Fz")
-    axes[2].plot(time_steps, desired_force_arr, "r--", label="Target Sinusoidal Force")
+    axes[2].plot(time_steps, desired_force_arr, "r--", label="Target Force Profile (1.0N -> 2.0N)")
     axes[2].set_ylabel("Z Force [N]")
     axes[2].grid(True, linestyle="--", alpha=0.6)
     axes[2].legend(loc="upper right", fontsize=8)
