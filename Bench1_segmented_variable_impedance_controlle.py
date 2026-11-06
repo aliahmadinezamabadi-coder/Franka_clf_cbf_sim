@@ -215,6 +215,39 @@ def get_joint_dynamics(robot):
     h = robot.sim.data.qfrc_bias[robot._ref_joint_vel_indexes].copy()
     return M, h
 
+
+
+def compute_force_metrics(time_arr, force_arr, target_force, start_time, end_time, band_pct=0.05):
+        # Extract segment mask
+        mask = (time_arr >= start_time) & (time_arr <= end_time)
+        t_seg = time_arr[mask]
+        f_seg = force_arr[mask]
+        
+        if len(f_seg) == 0:
+            return 0.0, None
+
+        # 1. Overshoot (%)
+        max_force = np.max(f_seg)
+        overshoot_val = max(0.0, max_force - target_force)
+        overshoot_pct = (overshoot_val / target_force) * 100.0
+
+        # 2. Settling Time (s) within ±band_pct (5% of target)
+        lower_bound = target_force * (1.0 - band_pct)
+        upper_bound = target_force * (1.0 + band_pct)
+        
+        # Check from end to beginning for when force last exited the ±5% band
+        outside_band_indices = np.where((f_seg < lower_bound) | (f_seg > upper_bound))[0]
+        
+        if len(outside_band_indices) == 0:
+            settling_time = 0.0  # Stayed in band the whole time
+        elif outside_band_indices[-1] == len(f_seg) - 1:
+            settling_time = None  # Did not settle within segment duration
+        else:
+            settling_idx = outside_band_indices[-1] + 1
+            settling_time = t_seg[settling_idx] - start_time
+
+        return overshoot_pct, settling_time
+
 # ------------------------------------------------------------------
 # 4. ART-AVIC Controller Class (Wang et al., 2027)
 # ------------------------------------------------------------------
@@ -505,6 +538,28 @@ if len(actual_pos_list) > 0:
     tau_joints_arr = np.atleast_2d(np.array(tau_joints_list))  
 
     time_steps = np.arange(len(actual_pos)) * dt_step
+
+    # Calculate metrics for Regime 1 (1.0 N step at t=0s)
+    os_1n, ts_1n = compute_force_metrics(time_steps, force_z, target_force=1.0, start_time=0.0, end_time=20.0, band_pct=0.05)
+
+    # Calculate metrics for Regime 2 (2.0 N step at t=20s)
+    os_2n, ts_2n = compute_force_metrics(time_steps, force_z, target_force=2.0, start_time=20.0, end_time=time_steps[-1], band_pct=0.05)
+
+    # Print Results to Terminal
+    print("\n" + "="*60)
+    print("           CONTACT FORCE TRACKING PERFORMANCE           ")
+    print("="*60)
+    ts_1n_str = f"{ts_1n:.3f} s" if ts_1n is not None else "Did not settle"
+    ts_2n_str = f"{ts_2n:.3f} s" if ts_2n is not None else "Did not settle"
+    
+    print(f"Phase 1 (Target = 1.0 N | t = 0s - 20s):")
+    print(f"  - Overshoot:     {os_1n:6.2f} %")
+    print(f"  - Settling Time: {ts_1n_str:>10} (±5% Band)")
+    print("-" * 60)
+    print(f"Phase 2 (Target = 2.0 N | t = 20s - 40s):")
+    print(f"  - Overshoot:     {os_2n:6.2f} %")
+    print(f"  - Settling Time: {ts_2n_str:>10} (±5% Band)")
+    print("="*60 + "\n")
 
     fig1, axes = plt.subplots(5, 1, figsize=(10, 18), sharex=True)
     
