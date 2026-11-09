@@ -46,7 +46,7 @@ env = suite.make(
     env_name="Wipe",
     robots="Panda",
     controller_configs=controller_config,
-    has_renderer=True,
+    has_renderer=False,
     has_offscreen_renderer=False,
     use_camera_obs=False,
     ignore_done=True,
@@ -152,7 +152,7 @@ def get_contact_wrench_at_eef(env, robot):
     
     return np.concatenate([total_force, total_torque])
 
-def add_sensor_noise(wrench, force_noise_std=0.05, torque_noise_std=0.005):
+def add_sensor_noise(wrench, force_noise_std=0.0, torque_noise_std=0.0):
     noise = np.concatenate([
         np.random.normal(0, force_noise_std, 3),
         np.random.normal(0, torque_noise_std, 3)
@@ -176,8 +176,8 @@ def get_eef_wrench_from_ft_sensor(env, robot,
                                   tool_mass=0.3, 
                                   tool_com_eef=np.zeros(3),
                                   add_noise=True,
-                                  force_noise_std=0.05,
-                                  torque_noise_std=0.005):
+                                  force_noise_std=0.0,
+                                  torque_noise_std=0.0):
     R_eef_to_world = get_eef_rotation_matrix(robot)
     contact_wrench_eef = get_contact_wrench_at_eef(env, robot)
     
@@ -235,36 +235,37 @@ def get_operational_space_matrices(J, M):
     return Lambda, J_bar, N
 
 
-def compute_force_metrics(time_arr, force_arr, target_force, start_time, end_time, band_pct=0.05):
-        # Extract segment mask
-        mask = (time_arr >= start_time) & (time_arr <= end_time)
-        t_seg = time_arr[mask]
-        f_seg = force_arr[mask]
-        
-        if len(f_seg) == 0:
-            return 0.0, None
+def compute_force_metrics(time_arr, force_arr, target_force, start_time, end_time, 
+                          step_time=None, band_pct=0.05, min_dwell_steps=20):
+    mask = (time_arr >= start_time) & (time_arr <= end_time)
+    t_seg = time_arr[mask]
+    f_seg = force_arr[mask]
+    
+    if len(f_seg) == 0:
+        return 0.0, None
 
-        # 1. Overshoot (%)
-        max_force = np.max(f_seg)
-        overshoot_val = max(0.0, max_force - target_force)
-        overshoot_pct = (overshoot_val / target_force) * 100.0
+    # Step time defaults to start_time if not provided
+    t_ref = step_time if step_time is not None else start_time
 
-        # 2. Settling Time (s) within ±band_pct (5% of target)
-        lower_bound = target_force * (1.0 - band_pct)
-        upper_bound = target_force * (1.0 + band_pct)
-        
-        # Check from end to beginning for when force last exited the ±5% band
-        outside_band_indices = np.where((f_seg < lower_bound) | (f_seg > upper_bound))[0]
-        
-        if len(outside_band_indices) == 0:
-            settling_time = 0.0  # Stayed in band the whole time
-        elif outside_band_indices[-1] == len(f_seg) - 1:
-            settling_time = None  # Did not settle within segment duration
-        else:
-            settling_idx = outside_band_indices[-1] + 1
-            settling_time = t_seg[settling_idx] - start_time
+    # 1. Overshoot (%)
+    max_force = np.max(f_seg)
+    overshoot_val = max(0.0, max_force - target_force)
+    overshoot_pct = (overshoot_val / target_force) * 100.0
 
-        return overshoot_pct, settling_time
+    # 2. Settling Time (s) based on first sustained entrance into ±band_pct
+    lower_bound = target_force * (1.0 - band_pct)
+    upper_bound = target_force * (1.0 + band_pct)
+    
+    in_band = (f_seg >= lower_bound) & (f_seg <= upper_bound)
+    
+    settling_time = None
+    # Find the first index where the signal STAYS in band for min_dwell_steps
+    for i in range(len(in_band) - min_dwell_steps):
+        if np.all(in_band[i : i + min_dwell_steps]):
+            settling_time = t_seg[i] - t_ref
+            break
+
+    return overshoot_pct, settling_time
 
 # ------------------------------------------------------------------
 # 4. Controller Definition (Exact 6D Stiffness QP Adaptation)
@@ -278,14 +279,14 @@ class Unified_CBF_CLF_Controller:
     def __init__(self, 
                  desired_force=2.0,
                  max_allowed_force=5.0,
-                 lambda_clf=0.5,
+                 lambda_clf=5.5,
                  gamma_cbf_force=1.0,
                  gamma_cbf_pos=1.0,
                  gamma_k=0.5,
                  p_gains=(10.0, 0.1),
                  w_slack=1e4,
                  w_k=100.0,
-                 surface_stiffness=400.0,
+                 surface_stiffness=20.0,
                  d_safe=0.05,
                  F_threshold=1.0,
                  alpha_filter=0.3):
@@ -526,7 +527,7 @@ force_ctrl = Unified_CBF_CLF_Controller(
     gamma_cbf_pos=1.0,
     gamma_k=0.5,         
     p_gains=(10.0, 0.1),
-    w_slack=1e4,
+    w_slack=1e6,
     w_k=100.0             
 )
 
@@ -552,6 +553,10 @@ kp_pos_list = []
 kp_ori_list = []
 u_K_ref_list = []  
 u_K_opt_list = []  
+
+
+raw_force_z_list = []
+filtered_force_list = []
 
 TOOL_MASS = 0.3
 TOOL_COM_EEF = np.array([0, 0, 0.02])
@@ -600,8 +605,8 @@ try:
         raw_sensor_wrench = get_contact_wrench_at_eef(env, robot)
         wrench_sensor_list.append(raw_sensor_wrench.copy())
 
-        current_force_z = ee_wrench_world[2]
-        force_z_list.append(current_force_z)
+        # current_force_z = ee_wrench_world[2]
+        # force_z_list.append(current_force_z)
 
         if step_idx % 20 == 0:
             pos_str = f"[{x_current[0]:.3f}, {x_current[1]:.3f}, {x_current[2]:.3f}]"
@@ -692,6 +697,10 @@ try:
             dt=dt_step
         )
 
+        # Log both raw and filtered forces for plotting & metrics
+        filtered_force_list.append(force_ctrl.filtered_force)
+        raw_force_z_list.append(ee_wrench_world[2])
+
         u_K_opt_list.append(u_K_opt_6d.copy())
         force_correction_list.append(np.linalg.norm(pos_offset_3d))
         force_error_list.append(force_ctrl.force_errors[-1] if force_ctrl.force_errors else 0)
@@ -760,9 +769,10 @@ try:
         action = np.concatenate([normalized_action, [-1.0]]) if env.action_dim > 7 else normalized_action
 
         obs, reward, done, info = env.step(action)
-        env.render()
 
-        time.sleep(0.005)
+        # env.render()
+        # time.sleep(0.005)
+        
         step_idx += 1
 
     print("="*110)
@@ -788,7 +798,12 @@ if len(actual_pos_list) > 0:
     actual_pos = np.array(actual_pos_list)
     desired_quat = np.array(desired_quat_list)
     actual_quat = np.array(actual_quat_list)
-    force_z = np.array(force_z_list)
+
+    # Use filtered_force_list here
+    force_z = np.array(filtered_force_list)
+    raw_force_z = np.array(raw_force_z_list)
+
+
     desired_force_arr = np.array(desired_force_list)
     force_corr = np.array(force_correction_list)
     pos_offset = np.array(position_offset_list)
@@ -800,6 +815,16 @@ if len(actual_pos_list) > 0:
     tau_joints_arr = np.atleast_2d(np.array(tau_joints_list))  
 
     time_steps = np.arange(len(actual_pos)) * 0.005
+
+    # ------------------------------------------------------------------
+    # Export Contact Force Data to CSV
+    # ------------------------------------------------------------------
+    csv_filename = "my_controller.csv"
+    force_data = np.column_stack((time_steps, raw_force_z, force_z, desired_force_arr))
+    header = "Time_s,Raw_Force_Z_N,Filtered_Normal_Force_N,Desired_Force_N"
+
+    np.savetxt(csv_filename, force_data, delimiter=",", header=header, comments="")
+    print(f"Successfully saved force data to '{csv_filename}'.")
 
     # Calculate metrics for Regime 1 (1.0 N step at t=0s)
     os_1n, ts_1n = compute_force_metrics(time_steps, force_z, target_force=1.0, start_time=0.0, end_time=20.0, band_pct=0.05)
@@ -843,9 +868,10 @@ if len(actual_pos_list) > 0:
     axes[1].grid(True, linestyle="--", alpha=0.6)
     axes[1].legend(loc="upper right", ncol=4, fontsize=8)
 
-    axes[2].plot(time_steps, force_z, "b-", label="Measured Fz")
+    axes[2].plot(time_steps, raw_force_z_list, "b-", alpha=0.3, label="Raw Sensor Fz")
+    axes[2].plot(time_steps, filtered_force_list, "b-", linewidth=1.8, label="Filtered F_normal")
     axes[2].plot(time_steps, desired_force_arr, "r--", label="Target Force Profile (1.0N -> 2.0N)")
-    axes[2].set_ylabel("Z Force [N]")
+    axes[2].set_ylabel("Normal Force [N]")
     axes[2].grid(True, linestyle="--", alpha=0.6)
     axes[2].legend(loc="upper right", fontsize=8)
 

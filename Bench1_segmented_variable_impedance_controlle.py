@@ -150,7 +150,7 @@ def get_contact_wrench_at_eef(env, robot):
     
     return np.concatenate([total_force, total_torque])
 
-def add_sensor_noise(wrench, force_noise_std=0.05, torque_noise_std=0.005):
+def add_sensor_noise(wrench, force_noise_std=0.0, torque_noise_std=0.0):
     noise = np.concatenate([
         np.random.normal(0, force_noise_std, 3),
         np.random.normal(0, torque_noise_std, 3)
@@ -174,8 +174,8 @@ def get_eef_wrench_from_ft_sensor(env, robot,
                                   tool_mass=0.3, 
                                   tool_com_eef=np.zeros(3),
                                   add_noise=True,
-                                  force_noise_std=0.05,
-                                  torque_noise_std=0.005):
+                                  force_noise_std=0.0,
+                                  torque_noise_std=0.0):
     R_eef_to_world = get_eef_rotation_matrix(robot)
     contact_wrench_eef = get_contact_wrench_at_eef(env, robot)
     
@@ -217,36 +217,37 @@ def get_joint_dynamics(robot):
 
 
 
-def compute_force_metrics(time_arr, force_arr, target_force, start_time, end_time, band_pct=0.05):
-        # Extract segment mask
-        mask = (time_arr >= start_time) & (time_arr <= end_time)
-        t_seg = time_arr[mask]
-        f_seg = force_arr[mask]
-        
-        if len(f_seg) == 0:
-            return 0.0, None
+def compute_force_metrics(time_arr, force_arr, target_force, start_time, end_time, 
+                          step_time=None, band_pct=0.05, min_dwell_steps=20):
+    mask = (time_arr >= start_time) & (time_arr <= end_time)
+    t_seg = time_arr[mask]
+    f_seg = force_arr[mask]
+    
+    if len(f_seg) == 0:
+        return 0.0, None
 
-        # 1. Overshoot (%)
-        max_force = np.max(f_seg)
-        overshoot_val = max(0.0, max_force - target_force)
-        overshoot_pct = (overshoot_val / target_force) * 100.0
+    # Step time defaults to start_time if not provided
+    t_ref = step_time if step_time is not None else start_time
 
-        # 2. Settling Time (s) within ±band_pct (5% of target)
-        lower_bound = target_force * (1.0 - band_pct)
-        upper_bound = target_force * (1.0 + band_pct)
-        
-        # Check from end to beginning for when force last exited the ±5% band
-        outside_band_indices = np.where((f_seg < lower_bound) | (f_seg > upper_bound))[0]
-        
-        if len(outside_band_indices) == 0:
-            settling_time = 0.0  # Stayed in band the whole time
-        elif outside_band_indices[-1] == len(f_seg) - 1:
-            settling_time = None  # Did not settle within segment duration
-        else:
-            settling_idx = outside_band_indices[-1] + 1
-            settling_time = t_seg[settling_idx] - start_time
+    # 1. Overshoot (%)
+    max_force = np.max(f_seg)
+    overshoot_val = max(0.0, max_force - target_force)
+    overshoot_pct = (overshoot_val / target_force) * 100.0
 
-        return overshoot_pct, settling_time
+    # 2. Settling Time (s) based on first sustained entrance into ±band_pct
+    lower_bound = target_force * (1.0 - band_pct)
+    upper_bound = target_force * (1.0 + band_pct)
+    
+    in_band = (f_seg >= lower_bound) & (f_seg <= upper_bound)
+    
+    settling_time = None
+    # Find the first index where the signal STAYS in band for min_dwell_steps
+    for i in range(len(in_band) - min_dwell_steps):
+        if np.all(in_band[i : i + min_dwell_steps]):
+            settling_time = t_seg[i] - t_ref
+            break
+
+    return overshoot_pct, settling_time
 
 # ------------------------------------------------------------------
 # 4. ART-AVIC Controller Class (Wang et al., 2027)
@@ -359,6 +360,9 @@ force_error_list = []
 position_offset_list = []
 damping_b_list = []
 
+raw_force_z_list = []
+filtered_force_list = []
+
 tau_task_list = []
 tau_total_list = []
 tau_joints_list = []
@@ -411,8 +415,8 @@ try:
         raw_sensor_wrench = get_contact_wrench_at_eef(env, robot)
         wrench_sensor_list.append(raw_sensor_wrench.copy())
 
-        current_force_z = ee_wrench_world[2]
-        force_z_list.append(current_force_z)
+        # current_force_z = ee_wrench_world[2]
+        # force_z_list.append(current_force_z)
 
 
         # ----------------------------------------------------------
@@ -434,6 +438,10 @@ try:
             normal_vec=normal_vec,
             dt=dt_step
         )
+
+        # Log both raw and filtered forces for plotting & metrics
+        filtered_force_list.append(controller.filtered_force)
+        raw_force_z_list.append(ee_wrench_world[2])
 
         desired_force_list.append(controller.fd)
         force_error_list.append(force_err)
@@ -531,13 +539,28 @@ if len(actual_pos_list) > 0:
     actual_pos = np.array(actual_pos_list)
     desired_quat = np.array(desired_quat_list)
     actual_quat = np.array(actual_quat_list)
-    force_z = np.array(force_z_list)
+
+    # Use filtered_force_list here
+    force_z = np.array(filtered_force_list)
+    raw_force_z = np.array(raw_force_z_list)
+
+
     desired_force_arr = np.array(desired_force_list)
     pos_offset = np.array(position_offset_list)
     b_arr = np.array(damping_b_list)
     tau_joints_arr = np.atleast_2d(np.array(tau_joints_list))  
 
     time_steps = np.arange(len(actual_pos)) * dt_step
+
+    # ------------------------------------------------------------------
+    # Export Contact Force Data to CSV
+    # ------------------------------------------------------------------
+    csv_filename = "art_avic_contact_forces.csv"
+    force_data = np.column_stack((time_steps, raw_force_z, force_z, desired_force_arr))
+    header = "Time_s,Raw_Force_Z_N,Filtered_Normal_Force_N,Desired_Force_N"
+
+    np.savetxt(csv_filename, force_data, delimiter=",", header=header, comments="")
+    print(f"Successfully saved force data to '{csv_filename}'.")
 
     # Calculate metrics for Regime 1 (1.0 N step at t=0s)
     os_1n, ts_1n = compute_force_metrics(time_steps, force_z, target_force=1.0, start_time=0.0, end_time=20.0, band_pct=0.05)
@@ -579,9 +602,10 @@ if len(actual_pos_list) > 0:
     axes[1].grid(True, linestyle="--", alpha=0.6)
     axes[1].legend(loc="upper right", ncol=4, fontsize=8)
 
-    axes[2].plot(time_steps, force_z, "b-", label="Measured Fz (ART-AVIC)")
-    axes[2].plot(time_steps, desired_force_arr, "r--", label="Target Force Profile")
-    axes[2].set_ylabel("Z Force [N]")
+    axes[2].plot(time_steps, raw_force_z_list, "b-", alpha=0.3, label="Raw Sensor Fz")
+    axes[2].plot(time_steps, filtered_force_list, "b-", linewidth=1.8, label="Filtered F_normal")
+    axes[2].plot(time_steps, desired_force_arr, "r--", label="Target Force Profile (1.0N -> 2.0N)")
+    axes[2].set_ylabel("Normal Force [N]")
     axes[2].grid(True, linestyle="--", alpha=0.6)
     axes[2].legend(loc="upper right", fontsize=8)
 
