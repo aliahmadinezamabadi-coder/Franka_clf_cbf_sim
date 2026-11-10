@@ -6,6 +6,8 @@ import robosuite as suite
 import robosuite.utils.transform_utils as T
 from robosuite.controllers import load_composite_controller_config
 import mujoco
+from PIL import Image
+
 
 # Set identical global random seed to replicate dirt positions & environment
 SEED = 15
@@ -44,9 +46,12 @@ env = suite.make(
     env_name="Wipe",
     robots="Panda",
     controller_configs=controller_config,
-    has_renderer=True,
-    has_offscreen_renderer=False,
+    has_renderer=False,           # Disable onscreen window
+    has_offscreen_renderer=True,  # Enable high-res offscreen rendering
     use_camera_obs=False,
+    camera_names="frontview",     # Options: "frontview", "agentview", "sideview", "birdview"
+    camera_heights=2160,          # High resolution for publication crispness
+    camera_widths=3840,
     ignore_done=True,
     horizon=1000000,
     seed=SEED,
@@ -215,6 +220,32 @@ def get_joint_dynamics(robot):
     h = robot.sim.data.qfrc_bias[robot._ref_joint_vel_indexes].copy()
     return M, h
 
+
+def save_high_res_snapshot_pdf(env, filename="sim_task_setup.pdf", camera_name="frontview", width=3840, height=2160):
+    """Renders offscreen RGB frame and exports directly as PDF."""
+    img = env.sim.render(
+        width=width,
+        height=height,
+        camera_name=camera_name,
+        depth=False
+    )
+    img_corrected = np.flipud(img)
+    
+    # Convert to PIL Image and save as PDF
+    pil_img = Image.fromarray(img_corrected)
+    pil_img.save(filename, "PDF", resolution=300.0)
+    print(f"Saved PDF snapshot: '{filename}'")
+
+
+def set_camera_zoom(env, camera_name="frontview", fovy=20.0):
+    """
+    Adjusts the camera field of view (FOV). 
+    Lower values = zoomed in (telephoto), Higher values = zoomed out (wide angle).
+    Default MuJoCo fovy is typically ~45.0 degrees.
+    """
+    cam_id = env.sim.model.camera_name2id(camera_name)
+    env.sim.model.cam_fovy[cam_id] = fovy
+
 # ------------------------------------------------------------------
 # 4. Proposed Adaptive Compensator Impedance Controller (Song et al.)
 # ------------------------------------------------------------------
@@ -351,8 +382,16 @@ F_amp  = 0.5    # Amplitude [N]
 F_freq = 0.5    # Frequency [Hz]
 omega  = 2.0 * np.pi * F_freq
 
+# Usage in your script:
+set_camera_zoom(env, camera_name="frontview", fovy=20.0)  # Zoom in
+save_high_res_snapshot_pdf(env, filename="sim_task_setup.pdf", camera_name="frontview")
+
 try:
     while step_idx < num_steps:
+        
+
+        if step_idx == 1000:  # e.g., t = 5.0s (1000 * 0.005s)
+            save_high_res_snapshot_pdf(env, filename="sim_task_setup.pdf", camera_name="frontview")
 
         # Calculate time-varying target force at current timestamp
         t_sim = step_idx * dt_step
@@ -451,9 +490,8 @@ try:
         action = np.concatenate([normalized_action, [-1.0]]) if env.action_dim > 7 else normalized_action
 
         obs, reward, done, info = env.step(action)
-        env.render()
-
-        time.sleep(0.005)
+        # env.render()
+        # time.sleep(0.005)
         step_idx += 1
 
     print("="*110)

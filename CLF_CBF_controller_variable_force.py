@@ -46,7 +46,7 @@ env = suite.make(
     env_name="Wipe",
     robots="Panda",
     controller_configs=controller_config,
-    has_renderer=True,
+    has_renderer=False,
     has_offscreen_renderer=False,
     use_camera_obs=False,
     ignore_done=True,
@@ -253,8 +253,8 @@ class Unified_CBF_CLF_Controller:
                  p_gains=(10.0, 0.1),
                  w_slack=1e4,
                  w_k=100.0,
-                 surface_stiffness=400.0,
-                 d_safe=0.003,
+                 surface_stiffness=200.0,
+                 d_safe=0.05,
                  F_threshold=1.0,
                  alpha_filter=0.3):
         
@@ -523,6 +523,10 @@ kp_ori_list = []
 u_K_ref_list = []  
 u_K_opt_list = []  
 
+# Initialize force logging lists
+raw_force_z_list = []
+filtered_force_list = []
+
 
 
 # Sinusoidal Target Force Parameters: F_d(t) = F_mean + A * sin(omega * t)
@@ -717,6 +721,10 @@ try:
         actual_quat_list.append(quat_current.copy())
         ori_error_list.append(ori_error.copy())
 
+        # Log raw sensor Z-force and filtered normal force
+        raw_force_z_list.append(ee_wrench_world[2])
+        filtered_force_list.append(force_ctrl.filtered_force)
+
         J_pos = robot.sim.data.get_site_jacp(eef_name)[:, robot._ref_joint_vel_indexes]
         J_rot = robot.sim.data.get_site_jacr(eef_name)[:, robot._ref_joint_vel_indexes]
         J = np.vstack([J_pos, J_rot])
@@ -742,9 +750,10 @@ try:
         action = np.concatenate([normalized_action, [-1.0]]) if env.action_dim > 7 else normalized_action
 
         obs, reward, done, info = env.step(action)
-        env.render()
+        
+        # env.render()
+        # time.sleep(0.005)
 
-        time.sleep(0.005)
         step_idx += 1
 
     print("="*110)
@@ -782,6 +791,45 @@ if len(actual_pos_list) > 0:
     tau_joints_arr = np.atleast_2d(np.array(tau_joints_list))  
 
     time_steps = np.arange(len(actual_pos)) * 0.005
+
+
+    # Convert lists to NumPy arrays
+    raw_force_z_arr = np.array(raw_force_z_list)
+    filtered_force_arr = np.array(filtered_force_list)
+    desired_force_arr = np.array(desired_force_list)
+    kp_pos_arr = np.array(kp_pos_list)      # Shape: (N, 3) -> [Kp_x, Kp_y, Kp_z]
+    kp_ori_arr = np.array(kp_ori_list)      # Shape: (N, 3) -> [Kp_roll, Kp_pitch, Kp_yaw]
+
+    # ------------------------------------------------------------------
+    # 1. Export Contact Force Data to CSV
+    # ------------------------------------------------------------------
+    force_csv_filename = "my_controller_forces.csv"
+    force_data = np.column_stack((time_steps, raw_force_z_arr, filtered_force_arr, desired_force_arr))
+    force_header = "Time_s,Raw_Force_Z_N,Filtered_Normal_Force_N,Desired_Force_N"
+
+    np.savetxt(force_csv_filename, force_data, delimiter=",", header=force_header, comments="")
+    print(f"Successfully saved force tracking data to '{force_csv_filename}'.")
+
+    # ------------------------------------------------------------------
+    # 2. Export 6D (Translational + Rotational) Stiffness Data to CSV
+    # ------------------------------------------------------------------
+    stiffness_csv_filename = "my_controller_stiffness.csv"
+    stiffness_data = np.column_stack((time_steps, kp_pos_arr, kp_ori_arr))
+    stiffness_header = "Time_s,Kp_x,Kp_y,Kp_z,Kp_roll,Kp_pitch,Kp_yaw"
+
+    np.savetxt(stiffness_csv_filename, stiffness_data, delimiter=",", header=stiffness_header, comments="")
+    print(f"Successfully saved 6D stiffness data to '{stiffness_csv_filename}'.")
+
+
+
+
+
+
+
+
+
+
+
     kp_ref_integrated = K_min_6d + np.cumsum(u_K_ref_arr * dt_step, axis=0)
 
     fig1, axes = plt.subplots(9, 1, figsize=(10, 27), sharex=True)

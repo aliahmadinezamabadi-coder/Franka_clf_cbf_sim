@@ -242,7 +242,7 @@ def compute_force_metrics(time_arr, force_arr, target_force, start_time, end_tim
     f_seg = force_arr[mask]
     
     if len(f_seg) == 0:
-        return 0.0, None
+        return 0.0, None, 0.0, 0.0
 
     # Step time defaults to start_time if not provided
     t_ref = step_time if step_time is not None else start_time
@@ -265,7 +265,12 @@ def compute_force_metrics(time_arr, force_arr, target_force, start_time, end_tim
             settling_time = t_seg[i] - t_ref
             break
 
-    return overshoot_pct, settling_time
+    # 3. Tracking Error Metrics (RMSE and MAE)
+    force_errors = f_seg - target_force
+    rmse = np.sqrt(np.mean(force_errors ** 2))  # Root Mean Square Error [N]
+    mae = np.mean(np.abs(force_errors))         # Mean Absolute Error [N]
+
+    return overshoot_pct, settling_time, rmse, mae
 
 # ------------------------------------------------------------------
 # 4. Controller Definition (Exact 6D Stiffness QP Adaptation)
@@ -286,7 +291,7 @@ class Unified_CBF_CLF_Controller:
                  p_gains=(10.0, 0.1),
                  w_slack=1e4,
                  w_k=100.0,
-                 surface_stiffness=20.0,
+                 surface_stiffness=200.0,
                  d_safe=0.05,
                  F_threshold=1.0,
                  alpha_filter=0.3):
@@ -826,11 +831,27 @@ if len(actual_pos_list) > 0:
     np.savetxt(csv_filename, force_data, delimiter=",", header=header, comments="")
     print(f"Successfully saved force data to '{csv_filename}'.")
 
+
+
+    # ------------------------------------------------------------------
+    # Export Stiffness Data to CSV
+    # ------------------------------------------------------------------
+    stiffness_csv_filename = "my_controller_stiffness.csv"
+    stiffness_data = np.column_stack((time_steps, kp_pos_arr, kp_ori_arr))
+    stiffness_header = "Time_s,Kp_x,Kp_y,Kp_z,Kp_roll,Kp_pitch,Kp_yaw"
+
+    np.savetxt(stiffness_csv_filename, stiffness_data, delimiter=",", header=stiffness_header, comments="")
+    print(f"Successfully saved stiffness data to '{stiffness_csv_filename}'.")
+
     # Calculate metrics for Regime 1 (1.0 N step at t=0s)
-    os_1n, ts_1n = compute_force_metrics(time_steps, force_z, target_force=1.0, start_time=0.0, end_time=20.0, band_pct=0.05)
+    os_1n, ts_1n, rmse_1n, mae_1n = compute_force_metrics(
+        time_steps, force_z, target_force=1.0, start_time=0.0, end_time=20.0, band_pct=0.05
+    )
 
     # Calculate metrics for Regime 2 (2.0 N step at t=20s)
-    os_2n, ts_2n = compute_force_metrics(time_steps, force_z, target_force=2.0, start_time=20.0, end_time=time_steps[-1], band_pct=0.05)
+    os_2n, ts_2n, rmse_2n, mae_2n = compute_force_metrics(
+        time_steps, force_z, target_force=2.0, start_time=20.0, end_time=time_steps[-1], band_pct=0.05
+    )
 
     # Print Results to Terminal
     print("\n" + "="*60)
@@ -842,10 +863,14 @@ if len(actual_pos_list) > 0:
     print(f"Phase 1 (Target = 1.0 N | t = 0s - 20s):")
     print(f"  - Overshoot:     {os_1n:6.2f} %")
     print(f"  - Settling Time: {ts_1n_str:>10} (±5% Band)")
+    print(f"  - RMSE:          {rmse_1n:6.4f} N")
+    print(f"  - MAE:           {mae_1n:6.4f} N")
     print("-" * 60)
     print(f"Phase 2 (Target = 2.0 N | t = 20s - 40s):")
     print(f"  - Overshoot:     {os_2n:6.2f} %")
     print(f"  - Settling Time: {ts_2n_str:>10} (±5% Band)")
+    print(f"  - RMSE:          {rmse_2n:6.4f} N")
+    print(f"  - MAE:           {mae_2n:6.4f} N")
     print("="*60 + "\n")
 
     kp_ref_integrated = K_min_6d + np.cumsum(u_K_ref_arr * dt_step, axis=0)

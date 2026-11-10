@@ -44,7 +44,7 @@ env = suite.make(
     env_name="Wipe",
     robots="Panda",
     controller_configs=controller_config,
-    has_renderer=True,
+    has_renderer=False,
     has_offscreen_renderer=False,
     use_camera_obs=False,
     ignore_done=True,
@@ -224,7 +224,7 @@ def compute_force_metrics(time_arr, force_arr, target_force, start_time, end_tim
     f_seg = force_arr[mask]
     
     if len(f_seg) == 0:
-        return 0.0, None
+        return 0.0, None, 0.0, 0.0
 
     # Step time defaults to start_time if not provided
     t_ref = step_time if step_time is not None else start_time
@@ -247,7 +247,12 @@ def compute_force_metrics(time_arr, force_arr, target_force, start_time, end_tim
             settling_time = t_seg[i] - t_ref
             break
 
-    return overshoot_pct, settling_time
+    # 3. Tracking Error Metrics (RMSE and MAE)
+    force_errors = f_seg - target_force
+    rmse = np.sqrt(np.mean(force_errors ** 2))  # Root Mean Square Error [N]
+    mae = np.mean(np.abs(force_errors))         # Mean Absolute Error [N]
+
+    return overshoot_pct, settling_time, rmse, mae
 
 
 # ------------------------------------------------------------------
@@ -363,7 +368,7 @@ TOOL_MASS = 0.3
 TOOL_COM_EEF = np.array([0, 0, 0.02])
 
 # Base Operational Space Impedance Gains
-Kp_pos_base = np.array([2000.0, 2000.0, 2000.0])
+Kp_pos_base = np.array([1000.0, 1000.0, 1000.0])
 Kd_pos_base = 2.0 * np.sqrt(Kp_pos_base)
 Kp_ori_base = np.array([500.0, 500.0, 500.0])
 Kd_ori_base = 2.0 * np.sqrt(Kp_ori_base)
@@ -488,9 +493,10 @@ try:
         action = np.concatenate([normalized_action, [-1.0]]) if env.action_dim > 7 else normalized_action
 
         obs, reward, done, info = env.step(action)
-        env.render()
 
-        time.sleep(0.005)
+        # env.render()
+        # time.sleep(0.005)
+
         step_idx += 1
 
     print("="*110)
@@ -539,10 +545,14 @@ if len(actual_pos_list) > 0:
     print(f"Successfully saved force data to '{csv_filename}'.")
 
     # Calculate metrics for Regime 1 (1.0 N step at t=0s)
-    os_1n, ts_1n = compute_force_metrics(time_steps, force_z, target_force=1.0, start_time=0.0, end_time=20.0, band_pct=0.05)
+    os_1n, ts_1n, rmse_1n, mae_1n = compute_force_metrics(
+        time_steps, force_z, target_force=1.0, start_time=0.0, end_time=20.0, band_pct=0.05
+    )
 
     # Calculate metrics for Regime 2 (2.0 N step at t=20s)
-    os_2n, ts_2n = compute_force_metrics(time_steps, force_z, target_force=2.0, start_time=20.0, end_time=time_steps[-1], band_pct=0.05)
+    os_2n, ts_2n, rmse_2n, mae_2n = compute_force_metrics(
+        time_steps, force_z, target_force=2.0, start_time=20.0, end_time=time_steps[-1], band_pct=0.05
+    )
 
     # Print Results to Terminal
     print("\n" + "="*60)
@@ -554,10 +564,14 @@ if len(actual_pos_list) > 0:
     print(f"Phase 1 (Target = 1.0 N | t = 0s - 20s):")
     print(f"  - Overshoot:     {os_1n:6.2f} %")
     print(f"  - Settling Time: {ts_1n_str:>10} (±5% Band)")
+    print(f"  - RMSE:          {rmse_1n:6.4f} N")
+    print(f"  - MAE:           {mae_1n:6.4f} N")
     print("-" * 60)
     print(f"Phase 2 (Target = 2.0 N | t = 20s - 40s):")
     print(f"  - Overshoot:     {os_2n:6.2f} %")
     print(f"  - Settling Time: {ts_2n_str:>10} (±5% Band)")
+    print(f"  - RMSE:          {rmse_2n:6.4f} N")
+    print(f"  - MAE:           {mae_2n:6.4f} N")
     print("="*60 + "\n")
 
     fig1, axes = plt.subplots(5, 1, figsize=(10, 18), sharex=True)
