@@ -241,7 +241,7 @@ class ART_AVIC_Controller:
                  alpha2=0.01,
                  b_min=10.0,
                  b_max=300.0,
-                 alpha_filter=0.3):
+                 alpha_filter=0.03):
         
         self.fd = desired_force
         self.m = m_val

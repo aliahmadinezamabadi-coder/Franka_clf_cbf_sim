@@ -276,7 +276,7 @@ class SongAdaptiveCompensatorController:
                  beta=1.0e-5,      # Beta adaptation rate matching Section IV-A.1
                  gamma=0.001,      # Derivative gain matching Section IV-A.1
                  d_init=0.0,
-                 alpha_filter=0.2):
+                 alpha_filter=0.03):
         
         self.fd = desired_force
         self.md = md
@@ -341,7 +341,7 @@ controller = SongAdaptiveCompensatorController(
     beta=1.0e-5,          # beta = 1e-5
     gamma=0.1,          # gamma = 0.001
     d_init=0.0,           # d(0) = 0
-    alpha_filter=0.2
+    alpha_filter=0.03
 )
 
 desired_force_list = []

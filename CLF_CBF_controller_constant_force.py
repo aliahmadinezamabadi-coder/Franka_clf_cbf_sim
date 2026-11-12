@@ -294,7 +294,7 @@ class Unified_CBF_CLF_Controller:
                  surface_stiffness=200.0,
                  d_safe=0.05,
                  F_threshold=1.0,
-                 alpha_filter=0.3):
+                 alpha_filter=0.03):
         
         self.desired_force = desired_force
         self.max_allowed_force = max_allowed_force

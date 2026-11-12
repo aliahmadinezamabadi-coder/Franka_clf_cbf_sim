@@ -40,7 +40,7 @@ controllers = [
     {
         "filename": "my_controller.csv",
         "stiffness_filename": "my_controller_stiffness.csv",
-        "label": "Proposed CLF–CBF",
+        "label": "UC-VIAC",
         "color": "#0072BD",   # Blue
         "ls_ctrl": "-",       # Solid for stiffness plot
         "ls_raw": "-.",
@@ -89,7 +89,7 @@ for ctrl in controllers:
                 data["Desired_Force_N"],
                 color="#000000",
                 linestyle="--",
-                linewidth=1.2,
+                linewidth=0.5,
                 label=r"$F_d(t)$ (Target)",
                 zorder=1,
             )
@@ -115,7 +115,7 @@ for ctrl in controllers:
                 data["Filtered_Normal_Force_N"],
                 color=ctrl["color"],
                 linestyle="-",
-                linewidth=1.3,
+                linewidth=0.5,
                 alpha=0.95,
                 label=rf"$F_n$ ({ctrl['label']})",
                 zorder=3,
@@ -207,7 +207,7 @@ for ctrl in controllers:
                 )
 
 # Subplot (a): Translational Stiffness
-ax_pos.set_ylabel(r"Trans. Stiffness $\mathbf{k}_p^{\mathrm{pos}}$ [N/m]")
+ax_pos.set_ylabel(r"$\mathbf{k}_p^{\mathrm{pos}}$ [N/m]")
 ax_pos.grid(True, which="major", linestyle=":", linewidth=0.5, alpha=0.7)
 ax_pos.set_axisbelow(True)
 ax_pos.legend(
@@ -223,7 +223,7 @@ ax_pos.legend(
 
 # Subplot (b): Rotational Stiffness
 ax_ori.set_xlabel(r"Time $t$ [s]")
-ax_ori.set_ylabel(r"Rot. Stiffness $\mathbf{k}_p^{\mathrm{ori}}$ [Nm/rad]")
+ax_ori.set_ylabel(r"$\mathbf{k}_p^{\mathrm{ori}}$ [Nm/rad]")
 ax_ori.grid(True, which="major", linestyle=":", linewidth=0.5, alpha=0.7)
 ax_ori.set_axisbelow(True)
 ax_ori.legend(
@@ -279,7 +279,7 @@ if os.path.exists(dynamic_force_file):
             linestyle="-.",
             linewidth=0.5,
             alpha=0.35,
-            label=r"$F_n^{\mathrm{raw}}$ (Proposed CLF–CBF)",
+            label=r"$F_n^{\mathrm{raw}}$ (UC-VIAC)",
             zorder=2,
         )
 
@@ -292,7 +292,7 @@ if os.path.exists(dynamic_force_file):
             linestyle="-",
             linewidth=1.3,
             alpha=0.95,
-            label=r"$F_n$ (Proposed CLF–CBF)",
+            label=r"$F_n$ (UC-VIAC)",
             zorder=3,
         )
 
