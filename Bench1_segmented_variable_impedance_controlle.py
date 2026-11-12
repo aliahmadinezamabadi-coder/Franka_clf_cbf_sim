@@ -280,7 +280,7 @@ class ART_AVIC_Controller:
                  alpha2=0.01,
                  b_min=10.0,
                  b_max=300.0,
-                 alpha_filter=0.3):
+                 alpha_filter=0.03):
         
         self.fd = desired_force
         self.m = m_val
@@ -324,13 +324,13 @@ class ART_AVIC_Controller:
         # Note: (fe - fd) = -e_f
         if e_f < 0:
             # Over-force stage (fd - fe < 0)
-            delta_b = (fe - self.fd) * self.theta * self.alpha1 * (self.b_curr ** 2)
+            delta_b = (fe - self.fd) * (self.theta / (self.alpha1 * (self.b_base ** 2)))
         else:
             # Under-force / Approach stage (fd - fe >= 0)
-            delta_b = (fe - self.fd) * self.theta * self.alpha2 * self.b_curr
+            delta_b = (fe - self.fd) * self.theta * self.alpha2 * self.b_base
             
         # Update actual damping parameter B = b + Δb - Eq. (13)
-        self.b_curr = np.clip(self.b_curr + delta_b, self.b_min, self.b_max)
+        self.b_curr = np.clip(self.b_base + delta_b, self.b_min, self.b_max)
         
         pos_offset_3d = -self.xr_normal_offset * n
         return pos_offset_3d, self.b_curr, fe, e_f
