@@ -261,12 +261,11 @@ class ART_AVIC_Controller:
     """
     Adaptive Reference Trajectory & Adaptive Variable Impedance Controller (Wang et al., 2027)
     
-    Implements:
-    - Eq. (6) Reference trajectory adaptive adjustment: xr(t) = xr(t-T) + kx * (fd - fe)
-    - Eq. (11)-(13) Segmented damping adaptation:
-        Δb = (fe - fd) * θ * α1 * b^2   if (fd - fe) < 0  (Overshoot/High contact force)
-        Δb = (fe - fd) * θ * α2 * b     if (fd - fe) >= 0 (Undershoot/Approach stage)
-    - Eq. (11) Implemented via Cartesian Impedance command to operational space execution.
+    Implements exact discrete-time outer admittance loop:
+    - Eq. (6):  xr(t) = xr(t-T) + kx * (fd - fe)
+    - Eq. (12): Segmented damping Δb
+    - Eq. (13): B(t) = b + Δb
+    - Eq. (5):  Discrete Euler integration of m*ddx + B(t)*dx + k*(x - xr) = kf*(fd - fe)
     """
     def __init__(self,
                  desired_force=2.0,
@@ -300,28 +299,30 @@ class ART_AVIC_Controller:
         self.alpha_filter = alpha_filter
         self.filtered_force = 0.0
         
-        # State tracking for trajectory correction along normal
-        self.xr_normal_offset = 0.0
+        # Eq. (6) Reference trajectory offset along inward normal n
+        self.xr_offset = 0.0
+        
+        # Eq. (5) Virtual admittance states along inward normal n
+        self.x_comp_offset = 0.0
+        self.dx_comp = 0.0
 
     def update(self, current_force_world, normal_vec, dt=0.005):
-        # 1. Projected scalar contact force fe along wiping normal n
+        # 1. Projected scalar contact force fe along inward wiping normal n
         n = normal_vec / (np.linalg.norm(normal_vec) + 1e-8)
         fe_raw = float(np.dot(current_force_world, n))
         
-        # Force low-pass filtering
+        # Low-pass filter
         fe = self.alpha_filter * fe_raw + (1.0 - self.alpha_filter) * self.filtered_force
         self.filtered_force = fe
         
         # Force error e_f = fd - fe
         e_f = self.fd - fe
         
-        # 2. Reference Trajectory Adaptive Adjustment Law - Eq. (6)
-        # xr_offset accumulation along normal direction: Δxr = kx * (fd - fe)
-        delta_xr = self.kx * e_f
-        self.xr_normal_offset += delta_xr
+        # 2. Eq. (6): Reference Trajectory Adaptive Adjustment Law
+        # Positive offset pushes deeper along inward normal n when fd > fe
+        self.xr_offset += self.kx * e_f
         
-        # 3. Segmented Damping Update Law - Eq. (12)
-        # Note: (fe - fd) = -e_f
+        # 3. Eq. (12): Segmented Damping Parameter Update Law
         if e_f < 0:
             # Over-force stage (fd - fe < 0)
             delta_b = (fe - self.fd) * (self.theta / (self.alpha1 * (self.b_base ** 2)))
@@ -329,11 +330,24 @@ class ART_AVIC_Controller:
             # Under-force / Approach stage (fd - fe >= 0)
             delta_b = (fe - self.fd) * self.theta * self.alpha2 * self.b_base
             
-        # Update actual damping parameter B = b + Δb - Eq. (13)
+        # 4. Eq. (13): Actual Damping B(t) = b + Δb
         self.b_curr = np.clip(self.b_base + delta_b, self.b_min, self.b_max)
         
-        pos_offset_3d = -self.xr_normal_offset * n
-        return pos_offset_3d, self.b_curr, fe, e_f
+        # 5. Eq. (5): Discrete-Time Admittance Integration
+        # m * ddx(t) + B(t) * dx(t) + k * [x(t) - xr(t)] = kf * (fd - fe)
+        ddx_comp = (1.0 / self.m) * (
+            self.kf * e_f
+            - self.b_curr * self.dx_comp
+            - self.k * (self.x_comp_offset - self.xr_offset)
+        )
+        self.dx_comp += ddx_comp * dt
+        self.x_comp_offset += self.dx_comp * dt
+        
+        # Compliant position & velocity modifications along inward normal n
+        pos_offset_3d = -self.x_comp_offset * n
+        vel_offset_3d = self.dx_comp * n
+        
+        return pos_offset_3d, vel_offset_3d, self.b_curr, fe, e_f
 
 # ------------------------------------------------------------------
 # 5. Initialize Controller & Loggers
@@ -428,17 +442,17 @@ try:
         # 1. Update ART-AVIC Trajectory & Damping
         # ----------------------------------------------------------
         current_time = step_idx * dt_step
-        controller.fd = 1.0 if current_time < 20.0 else 2.0  # Dynamic force profile
+        controller.fd = 1.0 if current_time < 20.0 else 1.5  # Dynamic force profile
 
         # ----------------------------------------------------------
-        # 1. Update ART-AVIC Trajectory & Damping
+        # 1. Update ART-AVIC Outer Admittance Loop (Eq. 5, 6, 12, 13)
         # ----------------------------------------------------------
         R_s = T.quat2mat(q_desired)
         normal_vec = -R_s[:, 2]  # Tool z-axis pointing into wiping surface
         
         ee_force_world = ee_wrench_world[:3]
         
-        pos_offset_3d, b_adapted, fe_filt, force_err = controller.update(
+        pos_offset_3d, vel_offset_3d, b_adapted, fe_filt, force_err = controller.update(
             current_force_world=ee_force_world,
             normal_vec=normal_vec,
             dt=dt_step
@@ -450,14 +464,14 @@ try:
 
         desired_force_list.append(controller.fd)
         force_error_list.append(force_err)
-        position_offset_list.append(np.linalg.norm(pos_offset_3d))
+        position_offset_list.append(controller.x_comp_offset)  # Signed normal offset [m]
         damping_b_list.append(b_adapted)
 
-        # Apply Reference Trajectory Correction Eq. (6)
+        # Compliant target position from Eq. (5)
         x_desired_modified = x_desired + pos_offset_3d
 
         # ----------------------------------------------------------
-        # 2. Operational Space Impedance Torque Computation
+        # 2. Inner Operational-Space Motion Tracking Controller
         # ----------------------------------------------------------
         ori_error = T.get_orientation_error(q_desired, quat_current)
         pos_error = x_desired_modified - x_current
@@ -469,12 +483,9 @@ try:
         actual_quat_list.append(quat_current.copy())
         ori_error_list.append(ori_error.copy())
 
-        # Anisotropic Damping Matrix (b_adapted along contact normal, base elsewhere)
-        n_sq = (normal_vec / (np.linalg.norm(normal_vec) + 1e-8)) ** 2
-        Kd_pos_vec = (1.0 - n_sq) * (2.0 * np.sqrt(Kp_pos_base)) + n_sq * b_adapted
-        
+        # Stiff inner position/velocity tracking (acts as the inner servo loop in Fig. 2)
         Kp_pos = np.diag(Kp_pos_base)
-        Kd_pos = np.diag(Kd_pos_vec)
+        Kd_pos = np.diag(2.0 * np.sqrt(Kp_pos_base))
         Kp_ori = np.diag(Kp_ori_base)
         Kd_ori = np.diag(Kd_ori_base)
 
@@ -487,17 +498,18 @@ try:
         J = np.vstack([J_pos, J_rot])
         dx = J @ dq
 
+        # Include desired admittance velocity along normal in velocity error
+        dx_desired = np.concatenate([vel_offset_3d, np.zeros(3)])
+        vel_error = dx_desired - dx
+
         M_q, h_q = get_joint_dynamics(robot)
 
         # Nullspace damping projection
         N = np.eye(robot.dof) - np.linalg.pinv(J) @ J
         tau_null = N @ (-3.0 * dq)
 
-        # Force Error Gain integration kf * (fd - fe) into impedance law Eq. (11)
-        F_force_feedforward = controller.kf * force_err * (normal_vec / (np.linalg.norm(normal_vec) + 1e-8))
-        
-        F_task = Kp @ cartesian_error - Kd @ dx
-        F_task[:3] += F_force_feedforward
+        # Pure inner tracking wrench (no extra F_force_feedforward needed)
+        F_task = Kp @ cartesian_error + Kd @ vel_error
 
         tau_task = J.T @ F_task
         tau_total = tau_task + h_q + tau_null
@@ -575,7 +587,7 @@ if len(actual_pos_list) > 0:
 
     # Calculate metrics for Regime 2 (2.0 N step at t=20s)
     os_2n, ts_2n, rmse_2n, mae_2n = compute_force_metrics(
-        time_steps, force_z, target_force=2.0, start_time=20.0, end_time=time_steps[-1], band_pct=0.05
+        time_steps, force_z, target_force=1.5, start_time=20.0, end_time=time_steps[-1], band_pct=0.05
     )
 
     # Print Results to Terminal
